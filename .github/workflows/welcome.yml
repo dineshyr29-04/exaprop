@@ -1,0 +1,20 @@
+name: Contributor Greetings
+
+on:
+  issues:
+    types: [opened]
+  pull_request_target:
+    types: [opened]
+
+jobs:
+  greeting:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/first-interaction@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          issue-message: "👋 Welcome to **FaultLab**! Thank you for opening your first issue in this repository. Our maintainers will review it shortly. Please ensure you've followed our [Contributing Guidelines](https://github.com/dineshyr29-04/faultlab/blob/main/CONTRIBUTING.md)."
+          pr-message: "🎉 Thank you for opening your first Pull Request to **FaultLab**! A maintainer will review your contribution soon. Please make sure your PR follows the [Pull Request Checklist](https://github.com/dineshyr29-04/faultlab/blob/main/.github/PULL_REQUEST_TEMPLATE.md)."

@@ -1,0 +1,68 @@
+# Binaries and build artifacts
+bin/
+dist/
+build/
+out/
+target/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Go
+vendor/
+*.test
+*.prof
+
+# Rust
+Cargo.lock
+target/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Node / Web
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.next/
+.cache/
+
+# Environments and Secrets
+.env
+.env*.local
+*.pem
+*.key
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.zed/
+.direnv/
+
+# Logs & temporary files
+*.log
+tmp/
+temp/
+
+
+

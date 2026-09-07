@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Community Discussions
+    url: https://github.com/dineshyr29-04/faultlab/discussions
+    about: Ask questions, share ideas, and discuss resilience patterns with the community.
+  - name: 🔒 Security Advisories
+    url: https://github.com/dineshyr29-04/faultlab/security/advisories
+    about: Report sensitive vulnerabilities privately.
