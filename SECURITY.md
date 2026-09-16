@@ -1,34 +1,55 @@
 # Security Policy
 
-## Supported Versions
+## Scope
 
-We provide security updates and patches for the current release cycle:
+ExaProp is an early-stage open-source systems and research project.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
-| < 0.1.0 | :x:                |
+Security reports are especially important for issues involving:
+
+* arbitrary code execution
+* privilege escalation
+* unintended network exposure
+* sensitive information disclosure
+* unsafe request handling
+* vulnerabilities in the proxy or observation components
+* vulnerabilities introduced through project dependencies
 
 ## Reporting a Vulnerability
 
-We take the security of FaultLab seriously. If you discover a security vulnerability, please do **NOT** report it in a public GitHub issue.
+**Please do not report security vulnerabilities through public GitHub Issues.**
 
-Instead, please report vulnerabilities privately:
+Use GitHub's private vulnerability reporting / Security Advisories mechanism when it is available for the repository.
 
-1. **GitHub Security Advisory**: Navigate to the [Security Advisories](https://github.com/dineshyr29-04/faultlab/security/advisories) tab and click **"Report a vulnerability"**.
-2. **Email**: Alternatively, send an email describing the issue, impact, and reproduction steps to the maintainers at `security@faultlab.dev`.
+When reporting a vulnerability, please include:
 
-### What to Include in Your Report
+* a clear description of the issue
+* affected component or version
+* reproduction steps or proof of concept
+* expected behavior
+* actual behavior
+* potential security impact
+* any known mitigation, if available
 
-- Detailed description of the vulnerability and its potential impact.
-- Step-by-step instructions or proof-of-concept (PoC) to reproduce the issue.
-- Affected system configurations, operating systems, and versions.
-- Any suggested mitigations or patches, if known.
+Please provide enough information for the issue to be reproduced and investigated.
 
-### Response Timeline
+## Supported Versions
 
-- **Initial Response**: Within 48 hours acknowledging receipt of your report.
-- **Triage & Assessment**: Within 5 business days detailing the severity and proposed action.
-- **Resolution**: A security patch will be prepared and released alongside a public advisory once verified.
+ExaProp is currently under active development.
 
-We appreciate your cooperation in responsibly disclosing potential security risks.
+Until the project establishes a formal release-support policy, security fixes will be handled based on the affected release and the severity of the issue.
+
+Development versions may change without notice.
+
+## Responsible Disclosure
+
+Please allow the maintainers reasonable time to investigate and address a reported vulnerability before publicly disclosing technical details.
+
+Security researchers are encouraged to avoid accessing, modifying, or deleting data that does not belong to them while demonstrating a vulnerability.
+
+## Experimental Features
+
+Some future ExaProp features may involve fault injection, traffic manipulation, or other potentially disruptive experiments.
+
+Such features must only be used against systems that you own or are explicitly authorized to test.
+
+Never use ExaProp's experimental capabilities against production or third-party systems without explicit authorization.

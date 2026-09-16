@@ -1,118 +1,87 @@
-# Contributor Covenant Code of Conduct
+# Code of Conduct
 
-## Our Pledge
+## Our Commitment
 
-We as members, contributors, and leaders pledge to make participation in our
-community a harassment-free experience for everyone, regardless of age, body
-size, visible or invisible disability, ethnicity, sex characteristics, gender
-identity and expression, level of experience, education, socio-economic status,
-nationality, personal appearance, race, caste, color, religion, or sexual identity
-and orientation.
+ExaProp is an open-source systems engineering and research project.
 
-We pledge to act and interact in ways that contribute to an open, welcoming,
-diverse, inclusive, and healthy community.
+The project aims to maintain a respectful, professional, and constructive environment for everyone who contributes, asks questions, reports issues, or participates in discussions.
 
-## Our Standards
+## Expected Behavior
 
-Examples of behavior that contributes to a positive environment for our
-community include:
+Participants are expected to:
 
-* Demonstrating empathy and kindness toward other people
-* Being respectful of differing opinions, viewpoints, and experiences
-* Giving and gracefully accepting constructive feedback
-* Accepting responsibility and apologizing to those affected by our mistakes,
-  and learning from the experience
-* Focusing on what is best not just for us as individuals, but for the
-  overall community
+* Be respectful and professional.
+* Communicate clearly and constructively.
+* Welcome different perspectives and technical approaches.
+* Give and receive constructive feedback.
+* Focus discussions on the work, evidence, and technical reasoning.
+* Respect other contributors' time and effort.
+* Follow the project's security and responsible-disclosure practices.
 
-Examples of unacceptable behavior include:
+## Unacceptable Behavior
 
-* The use of sexualized language or imagery, and sexual attention or
-  advances of any kind
-* Trolling, insulting or derogatory comments, and personal or political attacks
-* Public or private harassment
-* Publishing others' private information, such as a physical or email
-  address, without their explicit permission
-* Other conduct which could reasonably be considered inappropriate in a
-  professional setting
+The following behavior is not acceptable:
 
-## Enforcement Responsibilities
+* Harassment, discrimination, or personal attacks.
+* Threats or intimidation.
+* Trolling or deliberately disruptive behavior.
+* Publishing private or sensitive information without permission.
+* Deliberately disrupting project infrastructure or development.
+* Malicious behavior toward contributors or their work.
+* Using project discussions to promote abusive, hateful, or threatening content.
 
-Community leaders are responsible for clarifying and enforcing our standards of
-acceptable behavior and will take appropriate and fair corrective action in
-response to any behavior that they deem inappropriate, threatening, offensive,
-or harmful.
+Technical disagreement is welcome. Personal attacks are not.
 
-Community leaders have the right and responsibility to remove, edit, or reject
-comments, commits, code, wiki edits, issues, and other contributions that are
-not aligned to this Code of Conduct, and will communicate reasons for moderation
-decisions when appropriate.
+## Technical Discussions
 
-## Scope
+ExaProp is a systems and research project, so disagreements about architecture, implementation, experimental results, or research conclusions are expected.
 
-This Code of Conduct applies within all community spaces, and also applies when
-an individual is officially representing the community in public spaces.
-Examples of representing our community include using an official e-mail address,
-posting via an official social media account, or acting as an appointed
-representative at an online or offline event.
+When disagreeing:
+
+1. Explain the technical reasoning.
+2. Provide evidence or reproducible examples where possible.
+3. Critique ideas and implementations rather than people.
+4. Remain open to new evidence.
+
+Strong technical debate is encouraged when it remains constructive.
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders at [support@faultlab.dev].
-All complaints will be reviewed and investigated promptly and fairly.
+Project maintainers may take appropriate action when this Code of Conduct is violated.
 
-All community leaders are obligated to respect the privacy and security of the
-reporter of any incident.
+Possible actions include:
 
-## Enforcement Guidelines
+* Asking a participant to modify or stop inappropriate behavior.
+* Removing inappropriate comments or contributions.
+* Closing discussions or issues.
+* Temporarily restricting participation.
+* Removing participation privileges in serious or repeated cases.
 
-Community leaders will follow these Community Impact Guidelines in determining
-the consequences for any action they deem in violation of this Code of Conduct:
+The response will depend on the nature and severity of the behavior.
 
-### 1. Correction
+## Reporting Problems
 
-**Community Impact**: Use of inappropriate language or other behavior deemed
-unprofessional or unwelcome in the community.
+If you experience or observe unacceptable behavior, report it privately to the project maintainers.
 
-**Consequence**: A private, written warning from community leaders, providing
-clarity around the nature of the violation and an explanation of why the
-behavior was inappropriate. A public apology may be requested.
+For security vulnerabilities, **do not use public issues or discussions**. Follow the process described in [SECURITY.md](SECURITY.md).
 
-### 2. Warning
+## Scope
 
-**Community Impact**: A violation through a single incident or series
-of actions.
+This Code of Conduct applies to:
 
-**Consequence**: A warning with consequences for continued behavior. No
-interaction with the people involved, including unsolicited interaction with
-those enforcing the Code of Conduct, for a specified period of time. This
-includes avoiding interactions in community spaces as well as external channels
-like social media. Violating these terms may lead to a temporary or
-permanent ban.
+* GitHub Issues
+* Pull Requests
+* Discussions
+* Code reviews
+* Project documentation
+* Other project spaces maintained by ExaProp
 
-### 3. Temporary Ban
+## Good-Faith Participation
 
-**Community Impact**: A serious violation of community standards, including
-sustained inappropriate behavior.
+Contributors are expected to participate in good faith.
 
-**Consequence**: A temporary ban from any sort of interaction or public
-communication with the community for a specified period of time. No public or
-private interaction with the people involved, including unsolicited interaction
-with those enforcing the Code of Conduct, is allowed during this period.
-Violating these terms may lead to a permanent ban.
+Mistakes, disagreements, incomplete implementations, and incorrect technical assumptions are normal parts of software and research development. They should be addressed through constructive discussion rather than personal criticism.
 
-### 4. Permanent Ban
+## Final Principle
 
-**Community Impact**: Demonstrating a pattern of violation of community
-standards, including sustained inappropriate behavior, harassment of an
-individual, or aggression toward or disparagement of classes of individuals.
-
-**Consequence**: A permanent ban from any sort of public interaction within
-the community.
-
-## Attribution
-
-This Code of Conduct is adapted from the [Contributor Covenant](https://www.contributor-covenant.org),
-version 2.1, available at
-https://www.contributor-covenant.org/version/2/1/code_of_conduct.html.
+**Build the project. Challenge the ideas. Respect the people.**
