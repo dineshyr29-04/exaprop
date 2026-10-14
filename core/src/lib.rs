@@ -1,2 +1,4 @@
-// core engine of project imports
-// 
+//! Reusable networking and proxy functionality for ExaProp.
+
+pub mod proxy;
+//
