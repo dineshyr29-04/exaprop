@@ -1,17 +1,34 @@
-use ::std::io::Read;
-use ::std::net::TcpListener;
+use std::net::SocketAddr;
 
-fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:8080")?;
-    println!("Server is listening");
+use clap::{Parser, Subcommand};
 
-    let (mut stream, address) = listener.accept()?;
+/// ExaProp's local HTTP/1.1 reverse proxy.
+#[derive(Debug, Parser)]
+#[command(version, about)]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
 
-    println!("Client connected to :{address}");
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Forward HTTP requests to one backend and relay its responses.
+    Attach {
+        /// Local address where clients connect.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: SocketAddr,
 
-    let mut buffer = [0u8; 1024];
+        /// HTTP backend address.
+        #[arg(long, default_value = "127.0.0.1:8081")]
+        target: SocketAddr,
+    },
+}
 
-    let bytes_read = stream.read(&mut buffer)?;
-    println!("data:{}", String::from_utf8_lossy(&buffer[..bytes_read]));
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    match Args::parse().command {
+        Command::Attach { listen, target } => core_engine::proxy::run(listen, target).await?,
+    }
+
     Ok(())
 }
