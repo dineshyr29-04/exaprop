@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
-[![Issues](https://img.shields.io/github/issues/dineshyr29-04/faultlab.svg)](https://github.com/dineshyr29-04/faultlab/issues)
+[![Issues](https://img.shields.io/github/issues/dineshyr29-04/exaprop.svg)](https://github.com/dineshyr29-04/exaprop/issues)
 
 
 
@@ -18,15 +18,18 @@ The project is being developed incrementally, with each milestone adding one lay
 
 ## Status
 
-**Current development:** M1 — HTTP Observer
+**Current development:** M1 — local HTTP/1.1 reverse proxy foundation
 
-M2 will build the first diagnostic layer on top of the observations collected by M1.
+M1 currently forwards HTTP requests and responses. Structured observations and
+diagnostics are future work; the proxy does not yet collect or display them.
 
 ---
 
-## M1 — HTTP Observer
+## M1 — Local HTTP/1.1 Reverse Proxy
 
-M1 provides a local HTTP observation proxy that requires **no changes to the target application's source code**.
+M1 provides an explicit local reverse proxy. Clients must send their HTTP
+traffic through ExaProp; the target application's source code does not need to
+change.
 
 ```text
 Client
@@ -45,35 +48,40 @@ Example:
 ```bash
 exaprop attach \
     --listen 127.0.0.1:8080 \
-    --target 127.0.0.1:8081 \
-    --name backend-api
+    --target 127.0.0.1:8081
 ```
 
-M1 focuses on:
+`--listen` and `--target` default to those addresses.
 
-* TCP connection handling
-* HTTP/1.1 requests
-* HTTP/1.1 responses
-* Request/response observation
-* Status-code observation
-* Measured elapsed duration
-* Request timestamps
-* Forwarding traffic to the target application
-* Basic evidence collection
+The proxy currently:
 
-M1 does **not** attempt to determine root cause.
+* Forwards HTTP/1.1 requests and responses, including GET, HEAD, and POST.
+* Preserves request paths and query strings, response status, and end-to-end headers.
+* Relays binary bodies without interpreting their contents.
+* Supports `Content-Length` and chunked framing by decoding and reframing bodies; the forwarded body uses a recalculated `Content-Length`.
+* Supports persistent client connections and sequential requests on them.
+* Handles clients concurrently, up to 16 active connections.
+* Limits each request and response body to 4 MiB and applies a 15-second per-read/backend I/O timeout.
+* Removes hop-by-hop headers, including headers named by `Connection`; persistence is managed independently on each side.
+
+HTTP trailers, `Expect` headers, `CONNECT`, protocol upgrades/WebSockets, TLS,
+and HTTP/2 are unsupported. Oversized request bodies receive `413`, request
+body timeouts receive `408`, and unsupported `Expect` requests receive `417`.
+Oversized or invalid backend responses produce `502`; backend timeouts produce
+`504`. Malformed HTTP/1.1 framing is rejected by Hyper's parser. Bodies are buffered
+up to the documented limit before forwarding, so this is intended for local
+development and experiments rather than large streaming payloads. The proxy
+has no authentication; keep its listen address on a trusted interface.
+
+M1 does not yet record observations, detect anomalies, or determine root cause.
 
 For example:
 
 ```text
-GET /checkout
-Status: 500
-Duration: 1247 ms
+GET /checkout → backend response: 500
 ```
 
-This is an observation.
-
-It can later become evidence for higher-level diagnostics.
+The proxy relays this response; it does not yet report a structured observation.
 
 ### M1 Design Principle
 
@@ -135,23 +143,18 @@ ExaProp should not claim a root cause from insufficient evidence.
 
 ---
 
-## Architecture
+## Current architecture
 
-The early architecture is intentionally small:
+The CLI parses addresses and starts the proxy. Core owns the listener, HTTP
+handling, backend client, bounded body relay, and connection lifecycle.
 
 ```text
-             ExaProp
-                |
-        ┌───────┴───────┐
-        ↓               ↓
-   HTTP Observer   Diagnostic Engine
-        |               |
-        └───────┬───────┘
-                ↓
-             Evidence
+cli (Clap arguments)
+       ↓
+core_engine::proxy
+       ↓
+HTTP/1.1 listener → backend HTTP client
 ```
-
-The observer is the foundation. Diagnostic capabilities are built on top of the evidence it produces.
 
 ---
 
@@ -160,36 +163,25 @@ The observer is the foundation. Diagnostic capabilities are built on top of the 
 ```text
 exaprop/
 ├── Cargo.toml
+├── Cargo.lock
 ├── README.md
 ├── LICENSE
 ├── CONTRIBUTING.md
 ├── SECURITY.md
 ├── CODE_OF_CONDUCT.md
 │
-├── crates/
-│   └── exaprop-core/
-│       └── src/
-│           ├── lib.rs
-│           ├── model.rs
-│           ├── proxy.rs
-│           ├── http.rs
-│           └── detector.rs
+├── core/
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs
+│       └── proxy.rs
 │
 ├── cli/
-│   └── src/
-│       ├── main.rs
-│       └── display.rs
-│
-├── tests/
-│   └── integration/
-│
-├── lab/
-│   └── simple-http-server/
-│       └── server.py
-│
-└── docs/
-    ├── architecture.md
-    └── milestones/
+│   ├── Cargo.toml
+│   └── src/main.rs
+├── examples/
+│   └── echo_server.py
+└── README.md
 ```
 
 ---
@@ -200,7 +192,7 @@ Requirements:
 
 * Rust stable
 * Cargo
-* Python 3 for the local test server
+* Python 3 for the included manual-test backend
 
 Clone the repository:
 
@@ -237,6 +229,25 @@ Build:
 
 ```bash
 cargo build --workspace
+```
+
+For a manual end-to-end check, start the included backend:
+
+```bash
+python3 examples/echo_server.py
+```
+
+In a second terminal, run the proxy:
+
+```bash
+cargo run -p cli -- attach --listen 127.0.0.1:8080 --target 127.0.0.1:8081
+```
+
+In a third terminal, send requests through it:
+
+```bash
+curl -i 'http://127.0.0.1:8080/health?check=1'
+curl -i -X POST --data 'hello=exaprop' http://127.0.0.1:8080/echo
 ```
 
 ---
