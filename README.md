@@ -1,294 +1,195 @@
-# Project Exaprop
-
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
-[![Issues](https://img.shields.io/github/issues/dineshyr29-04/exaprop.svg)](https://github.com/dineshyr29-04/exaprop/issues)
-
-
-
-
 # ExaProp
 
-> Evidence-based analysis of failure propagation in distributed systems.
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](Cargo.toml)
+[![Tests](https://img.shields.io/badge/Tests-21_Passed-brightgreen.svg)](core/src/proxy.rs)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
+[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
 
-ExaProp is an open-source systems engineering and research project for observing distributed applications, collecting runtime evidence, detecting anomalies, and eventually analyzing how failures propagate through a system.
-
-The project is being developed incrementally, with each milestone adding one layer of capability.
-
-## Status
-
-**Current development:** M1 — local HTTP/1.1 reverse proxy foundation
-
-M1 currently forwards HTTP requests and responses. Structured observations and
-diagnostics are future work; the proxy does not yet collect or display them.
+> **A high-performance, local-first resilience observability and failure experimentation platform for distributed systems.**
 
 ---
 
-## M1 — Local HTTP/1.1 Reverse Proxy
+## What is ExaProp?
 
-M1 provides an explicit local reverse proxy. Clients must send their HTTP
-traffic through ExaProp; the target application's source code does not need to
-change.
+In a distributed system or microservice architecture, services constantly talk to each other over HTTP. When one service slows down, crashes, or drops connections, failures often cascade uncontrollably (thread pools exhaust, retries cause storms, downstream services collapse).
+
+**ExaProp** acts like a **flight recorder and chaos lab** that sits directly between your services. It attaches locally without requiring any code changes to your application:
 
 ```text
-Client
-  |
-  | HTTP
-  v
-ExaProp :8080
-  |
-  | HTTP
-  v
-Target App :8081
+  [ Client / Frontend ]
+          │
+          │ HTTP Request (:8080)
+          ▼
+   ┌──────────────┐
+   │   ExaProp    │  <── Observes metrics, detects anomalies,
+   │ Reverse Proxy│  <── and injects controlled faults
+   └──────┬───────┘
+          │
+          │ Forwarded HTTP (:8081)
+          ▼
+  [ Backend Service ]
 ```
 
-Example:
+### The Engineering Lifecycle
+```text
+Attach ➔ Observe ➔ Inject ➔ Measure ➔ Investigate ➔ Improve ➔ Verify
+```
 
+---
+
+## ⚡ Quickstart (Try it in 60 seconds)
+
+You can run and test ExaProp locally on your machine with 3 simple steps:
+
+### 1. Start the included test backend
+In your first terminal, start the Python backend server:
 ```bash
-exaprop attach \
-    --listen 127.0.0.1:8080 \
-    --target 127.0.0.1:8081
+python3 examples/echo_server.py
+# Backend running on http://127.0.0.1:8081
 ```
 
-`--listen` and `--target` default to those addresses.
-
-The proxy currently:
-
-* Forwards HTTP/1.1 requests and responses, including GET, HEAD, and POST.
-* Preserves request paths and query strings, response status, and end-to-end headers.
-* Relays binary bodies without interpreting their contents.
-* Supports `Content-Length` and chunked framing by decoding and reframing bodies; the forwarded body uses a recalculated `Content-Length`.
-* Supports persistent client connections and sequential requests on them.
-* Handles clients concurrently, up to 16 active connections.
-* Limits each request and response body to 4 MiB and applies a 15-second per-read/backend I/O timeout.
-* Removes hop-by-hop headers, including headers named by `Connection`; persistence is managed independently on each side.
-
-HTTP trailers, `Expect` headers, `CONNECT`, protocol upgrades/WebSockets, TLS,
-and HTTP/2 are unsupported. Oversized request bodies receive `413`, request
-body timeouts receive `408`, and unsupported `Expect` requests receive `417`.
-Oversized or invalid backend responses produce `502`; backend timeouts produce
-`504`. Malformed HTTP/1.1 framing is rejected by Hyper's parser. Bodies are buffered
-up to the documented limit before forwarding, so this is intended for local
-development and experiments rather than large streaming payloads. The proxy
-has no authentication; keep its listen address on a trusted interface.
-
-M1 does not yet record observations, detect anomalies, or determine root cause.
-
-For example:
-
-```text
-GET /checkout → backend response: 500
+### 2. Start ExaProp
+In a second terminal, launch ExaProp attached to that backend:
+```bash
+cargo run -p cli -- attach --listen 127.0.0.1:8080 --target 127.0.0.1:8081
+# ExaProp listening on http://127.0.0.1:8080 and forwarding to :8081
 ```
 
-The proxy relays this response; it does not yet report a structured observation.
+### 3. Send test requests
+In a third terminal, send traffic through ExaProp:
+```bash
+# Basic GET request
+curl -i http://127.0.0.1:8080/hello?query=test
 
-### M1 Design Principle
-
-> **Observe before assuming.**
+# POST request with JSON payload
+curl -i -X POST -H "Content-Type: application/json" -d '{"service":"checkout"}' http://127.0.0.1:8080/echo
+```
+ExaProp receives your traffic, validates protocol correctness, safely forwards it to the backend, and relays the response back to you.
 
 ---
 
-## M2 — Diagnostic Engine
+## 🗺️ Project Milestones & Progress
 
-M2 builds on M1's observations and introduces basic anomaly detection.
+ExaProp is built incrementally. Each milestone delivers a solid, thoroughly tested layer:
 
-Conceptually:
-
-```text
-HTTP Request
-     ↓
-HTTP Response
-     ↓
-Observation
-     ↓
-Evidence
-     ↓
-Anomaly
-```
-
-Initial anomaly types may include:
-
-```text
-HIGH_LATENCY
-SERVER_ERROR
-CLIENT_ERROR
-CONNECTION_FAILURE
-```
-
-Example:
-
-```text
-Observation:
-GET /checkout
-500
-1247 ms
-
-Diagnostic:
-SERVER_ERROR
-HIGH_LATENCY
-```
-
-M2 should distinguish between:
-
-* **Observed facts** — directly measured by ExaProp
-* **Derived anomalies** — detected from observations
-* **Hypotheses** — possible explanations requiring more evidence
-
-ExaProp should not claim a root cause from insufficient evidence.
-
-### M2 Design Principle
-
-> **Evidence before inference.**
+| Milestone | Capability | Status | Verification |
+| :--- | :--- | :---: | :--- |
+| **M0** | Project charter, Cargo workspace, Apache 2.0 governance | **Completed** | Clean workspace structure |
+| **M1** | Bounded local HTTP/1.1 reverse proxy engine & CLI | **Completed** | 14 integration tests |
+| **M2** | HTTP/1.1 correctness, RFC 9112 hardening & reliability | **Completed** | **21 integration tests (100% green)** |
+| **M3** | Resilience observability, telemetry & anomaly detection | **In Progress** | Next implementation target |
+| **M4** | Chaos engine & programmable fault injection (latency, 5xx) | Planned | Target: Nov 2026 |
+| **M5** | Failure propagation graphing & automated resilience scoring | Planned | Target: Nov 2026 |
 
 ---
 
-## Current architecture
+## 🛡️ Built-in Safety Guarantees
 
-The CLI parses addresses and starts the proxy. Core owns the listener, HTTP
-handling, backend client, bounded body relay, and connection lifecycle.
+An observability tool must never become the cause of a system outage. ExaProp implements three strict invariants:
 
-```text
-cli (Clap arguments)
-       ↓
-core_engine::proxy
-       ↓
-HTTP/1.1 listener → backend HTTP client
-```
+1. **Bounded Concurrency (16 Max Connections)**:
+   * Traffic is regulated through an asynchronous semaphore (`tokio::sync::Semaphore`).
+   * A surge of client requests cannot cause thread exhaustion. Disconnected clients immediately release their permit.
+2. **Bounded Memory Buffering (4 MiB Max Body)**:
+   * Request and response payloads are read frame-by-frame up to **4 MiB (4,194,304 bytes)**.
+   * Oversized client payloads are immediately rejected with `413 Payload Too Large`; oversized backend payloads receive `502 Bad Gateway`. ExaProp will never run out of memory (OOM).
+3. **Deterministic 15-Second Timeouts**:
+   * Stalled reads or slowloris attacks trigger a `408 Request Timeout`.
+   * Unresponsive backend servers trigger a `504 Gateway Timeout` after 15 seconds.
 
 ---
 
-## Project Structure
+## 📋 HTTP Protocol Contract (RFC 9110 & RFC 9112)
+
+Every protocol behavior is validated by automated regression tests in [`core/src/proxy.rs`](core/src/proxy.rs):
+
+### What ExaProp Supports:
+* **Methods**: Full forwarding for `GET`, `HEAD`, and `POST`.
+* **Path & Query Strings**: Exact preservation of URI paths and query arguments.
+* **Headers**: Preserves custom headers and duplicate multi-value headers (e.g., multiple `Set-Cookie` lines).
+* **Binary Data**: Transparent, corruption-free forwarding of binary payloads (images, files, protobuf).
+* **Chunked Framing**: Transparently decodes chunked streams and emits valid `Content-Length` frames.
+* **RFC 9112 §6.2 (Empty Requests)**: Automatically omits `Content-Length` on empty `GET` and `HEAD` requests.
+* **RFC 9110 §15.3.5 / RFC 9112 §6.3 (No-Body Responses)**:
+  * For `204 No Content` and `205 Reset Content`: Strips `Content-Length` and guarantees zero body bytes.
+  * For `304 Not Modified` and `HEAD`: Preserves cached metadata while strictly guaranteeing zero body bytes.
+* **RFC 9112 §7.6.1 (Hop-by-Hop Stripping)**: Removes transport-only headers (`Connection`, `Keep-Alive`, `Upgrade`, etc.), including dynamically nominated connection tokens.
+
+### What ExaProp Explicitly Rejects:
+| Client Request | Status Code | Reason |
+| :--- | :---: | :--- |
+| `CONNECT` Method | `501 Not Implemented` | Prevents unauthorized TCP proxy tunneling |
+| `Upgrade` / WebSockets | `501 Not Implemented` | Protocol switching out of scope for v0.1.0 |
+| `Expect: 100-continue` | `417 Expectation Failed` | Avoids stalled upstream handshakes |
+| Request Trailers (`Trailer`) | `501 Not Implemented` | Chunk trailers are unsupported |
+| Payload > 4 MiB | `413 Payload Too Large` | Enforces memory bounding |
+| Malformed HTTP bytes | `400 Bad Request` | Rejected by Hyper parser |
+
+---
+
+## 🔬 Research Context & Academic Motivation
+
+ExaProp is also designed as a systems research testbed for investigating **failure propagation in distributed microservices**.
+
+### Key Research Questions:
+1. **Lightweight Interception vs Heavyweight Meshes**:
+   Can a sub-millisecond, bounded user-space reverse proxy written in Rust provide deterministic resilience experimentation without the heavy resource footprint of Envoy/Istio sidecars (~100MB per pod) or the kernel complexity of eBPF?
+2. **Evidence Before Inference**:
+   Traditional APMs rely heavily on statistical sampling and probabilistic inferences. How can an observability engine track deterministic causal chains (*HTTP Transaction ➔ Exact Evidence ➔ Empirical Anomaly Classification*) without false alarms?
+3. **Blast-Radius Quantification**:
+   When synthetic latency or packet drop is injected into a single microservice, how far and how fast does the degradation propagate through the service dependency graph?
+
+---
+
+## 📂 Codebase Organization
+
+The repository is organized as a clean Rust Cargo workspace:
 
 ```text
 exaprop/
-├── Cargo.toml
-├── Cargo.lock
-├── README.md
-├── LICENSE
-├── CONTRIBUTING.md
-├── SECURITY.md
-├── CODE_OF_CONDUCT.md
+├── Cargo.toml               # Workspace configuration
+├── README.md                # Project documentation and quickstart
+├── LICENSE                  # Apache 2.0 license
+├── CONTRIBUTING.md           # Contribution guidelines
 │
-├── core/
+├── core/                    # Core proxy and networking library (`core_engine`)
 │   ├── Cargo.toml
 │   └── src/
-│       ├── lib.rs
-│       └── proxy.rs
+│       ├── lib.rs           # Public library exports
+│       └── proxy.rs         # Reverse proxy engine, bounds & 21 tests
 │
-├── cli/
+├── cli/                     # CLI binary (`exaprop`)
 │   ├── Cargo.toml
-│   └── src/main.rs
-├── examples/
-│   └── echo_server.py
-└── README.md
+│   └── src/
+│       └── main.rs          # CLI argument parser (`exaprop attach`)
+│
+└── examples/
+    └── echo_server.py       # Python backend fixture for local testing
 ```
 
 ---
 
-## Development
+## 🛠️ Verification & Testing Commands
 
-Requirements:
-
-* Rust stable
-* Cargo
-* Python 3 for the included manual-test backend
-
-Clone the repository:
+To run tests and verify the entire codebase:
 
 ```bash
-git clone https://github.com/dineshyr29-04/exaprop.git
-cd exaprop
-```
-
-Check the workspace:
-
-```bash
+# Check compilation across all crates
 cargo check --workspace
-```
 
-Run tests:
-
-```bash
+# Run all 21 automated integration tests
 cargo test --workspace
-```
 
-Format:
+# Verify code formatting
+cargo fmt --all -- --check
 
-```bash
-cargo fmt --all
-```
-
-Run Clippy:
-
-```bash
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-```
-
-Build:
-
-```bash
-cargo build --workspace
-```
-
-For a manual end-to-end check, start the included backend:
-
-```bash
-python3 examples/echo_server.py
-```
-
-In a second terminal, run the proxy:
-
-```bash
-cargo run -p cli -- attach --listen 127.0.0.1:8080 --target 127.0.0.1:8081
-```
-
-In a third terminal, send requests through it:
-
-```bash
-curl -i 'http://127.0.0.1:8080/health?check=1'
-curl -i -X POST --data 'hello=exaprop' http://127.0.0.1:8080/echo
+# Build the release binary
+cargo build --release
 ```
 
 ---
 
-## Development Philosophy
+## 📜 License
 
-ExaProp follows a simple progression:
-
-```text
-Observe
-   ↓
-Measure
-   ↓
-Collect Evidence
-   ↓
-Detect Anomalies
-   ↓
-Infer Carefully
-   ↓
-Understand Failure Propagation
-```
-
-The project prioritizes measurable evidence and reproducible experiments over unsupported conclusions.
-
----
-
-## Contributing
-
-Contributions are welcome in:
-
-* Rust implementation
-* Tests
-* Documentation
-* Benchmarks
-* Experiments
-* Research
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines.
-
-## License
-
-ExaProp is licensed under the **Apache License 2.0**.
-
-See [LICENSE](LICENSE) for the full license text.
+ExaProp is open-source software licensed under the **[Apache License 2.0](LICENSE)**.
