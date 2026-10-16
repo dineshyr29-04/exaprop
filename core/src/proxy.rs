@@ -225,8 +225,12 @@ async fn handle_request(
             return error_response(StatusCode::BAD_REQUEST, "Could not read request body\n");
         }
     };
-    if let Ok(length) = HeaderValue::from_str(&body.len().to_string()) {
-        headers.insert(CONTENT_LENGTH, length);
+    // RFC 9112 §6.2: A client SHOULD NOT send Content-Length when the request
+    // has no body and the method semantics do not anticipate one (e.g. GET, HEAD).
+    if !body.is_empty() || (method != Method::GET && method != Method::HEAD) {
+        if let Ok(length) = HeaderValue::from_str(&body.len().to_string()) {
+            headers.insert(CONTENT_LENGTH, length);
+        }
     }
 
     // Keep the client's Host header when present. It is often used by the
@@ -297,12 +301,21 @@ async fn handle_request(
         if let Ok(length) = HeaderValue::from_str(&body.len().to_string()) {
             headers.insert(CONTENT_LENGTH, length);
         }
+    } else if status == StatusCode::NO_CONTENT || status == StatusCode::RESET_CONTENT {
+        // RFC 9110 §15.3.5: 204 and 205 responses MUST NOT include Content-Length.
+        headers.remove(CONTENT_LENGTH);
     }
+
+    let response_body = if body_is_forbidden {
+        Bytes::new()
+    } else {
+        body
+    };
 
     match Response::builder()
         .status(status)
         .version(version)
-        .body(Full::new(body))
+        .body(Full::new(response_body))
     {
         Ok(mut response) => {
             *response.headers_mut() = headers;
@@ -843,5 +856,193 @@ mod tests {
         assert!(!headers.contains_key("keep-alive"));
         assert!(!headers.contains_key("x-private"));
         assert_eq!(headers["x-end-to-end"], "keep");
+    }
+
+    #[tokio::test]
+    async fn forwards_no_content_and_not_modified_without_body() {
+        let (backend, backend_stop, backend_task) = start_backend(|request| async move {
+            if request.uri().path() == "/no-content" {
+                let mut res = Response::new(Full::new(Bytes::new()));
+                *res.status_mut() = StatusCode::NO_CONTENT;
+                res.headers_mut()
+                    .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+                res
+            } else {
+                let mut res = Response::new(Full::new(Bytes::new()));
+                *res.status_mut() = StatusCode::NOT_MODIFIED;
+                res.headers_mut()
+                    .insert("etag", HeaderValue::from_static("\"abc-123\""));
+                res.headers_mut()
+                    .insert(CONTENT_LENGTH, HeaderValue::from_static("42"));
+                res
+            }
+        })
+        .await;
+        let (proxy, proxy_stop, proxy_task) = start_proxy(backend).await;
+
+        let client = test_client();
+
+        let res204 = client
+            .request(request(
+                format!("http://{proxy}/no-content"),
+                Method::GET,
+                b"",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res204.status(), StatusCode::NO_CONTENT);
+        assert!(!res204.headers().contains_key(CONTENT_LENGTH));
+        let body204 = res204.into_body().collect().await.unwrap().to_bytes();
+        assert!(body204.is_empty());
+
+        let res304 = client
+            .request(request(
+                format!("http://{proxy}/not-modified"),
+                Method::GET,
+                b"",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res304.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(res304.headers()["etag"], "\"abc-123\"");
+        assert!(!res304.headers().contains_key(CONTENT_LENGTH));
+        let body304 = res304.into_body().collect().await.unwrap().to_bytes();
+        assert!(body304.is_empty());
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn accepts_body_at_exact_limit() {
+        let (backend, backend_stop, backend_task) = start_backend(|request| async move {
+            let body = request.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body.len(), MAX_BODY_BYTES);
+            Response::new(Full::new(Bytes::from("exact_limit_ok")))
+        })
+        .await;
+        let (proxy, proxy_stop, proxy_task) = start_proxy(backend).await;
+
+        let payload = vec![b'z'; MAX_BODY_BYTES];
+        let response = test_client()
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{proxy}/exact"))
+                    .body(Full::new(Bytes::from(payload)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(resp_body.as_ref(), b"exact_limit_ok");
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_expect_header() {
+        let (backend, backend_stop, backend_task) =
+            start_backend(|_| async { Response::new(Full::new(Bytes::new())) }).await;
+        let (proxy, proxy_stop, proxy_task) = start_proxy(backend).await;
+
+        let mut req = request(format!("http://{proxy}/expect"), Method::POST, b"data");
+        req.headers_mut()
+            .insert(EXPECT, HeaderValue::from_static("100-continue"));
+        let response = test_client().request(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::EXPECTATION_FAILED);
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_trailer_header() {
+        let (backend, backend_stop, backend_task) =
+            start_backend(|_| async { Response::new(Full::new(Bytes::new())) }).await;
+        let (proxy, proxy_stop, proxy_task) = start_proxy(backend).await;
+
+        let mut req = request(format!("http://{proxy}/trailer"), Method::POST, b"data");
+        req.headers_mut()
+            .insert("trailer", HeaderValue::from_static("x-checksum"));
+        let response = test_client().request(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_connect_method() {
+        let (backend, backend_stop, backend_task) =
+            start_backend(|_| async { Response::new(Full::new(Bytes::new())) }).await;
+        let (proxy, proxy_stop, proxy_task) = start_proxy(backend).await;
+
+        let req = Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("http://{proxy}/tunnel"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = test_client().request(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn preserves_duplicate_headers() {
+        let (backend, backend_stop, backend_task) = start_backend(|_| async {
+            let mut res = Response::new(Full::new(Bytes::from("cookie_ok")));
+            res.headers_mut()
+                .append("set-cookie", HeaderValue::from_static("session=123"));
+            res.headers_mut()
+                .append("set-cookie", HeaderValue::from_static("theme=dark"));
+            res
+        })
+        .await;
+        let (proxy, proxy_stop, proxy_task) = start_proxy(backend).await;
+
+        let response = test_client()
+            .request(request(format!("http://{proxy}/cookies"), Method::GET, b""))
+            .await
+            .unwrap();
+
+        let cookies: Vec<&str> = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, vec!["session=123", "theme=dark"]);
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn omits_content_length_on_empty_get_request() {
+        let (backend, backend_stop, backend_task) = start_backend(|request| async move {
+            assert!(!request.headers().contains_key(CONTENT_LENGTH));
+            Response::new(Full::new(Bytes::from("no_cl_ok")))
+        })
+        .await;
+        let (proxy, proxy_stop, proxy_task) = start_proxy(backend).await;
+
+        let response = test_client()
+            .request(request(
+                format!("http://{proxy}/empty-get"),
+                Method::GET,
+                b"",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
     }
 }
