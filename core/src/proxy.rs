@@ -5,16 +5,24 @@
 //! are buffered up to [`MAX_BODY_BYTES`] so every in-flight request has a
 //! predictable memory ceiling.
 
-use std::{convert::Infallible, future::Future, net::SocketAddr, time::Duration};
+use std::{
+    convert::Infallible,
+    future::Future,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Full};
 use hyper::{
     body::{Body, Incoming},
-    header::{HeaderMap, HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, EXPECT, UPGRADE},
+    header::{
+        HeaderMap, HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, EXPECT, UPGRADE, VIA,
+    },
     server::conn::http1,
     service::service_fn,
-    Method, Request, Response, StatusCode, Uri,
+    Method, Request, Response, StatusCode, Uri, Version,
 };
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
@@ -22,10 +30,12 @@ use hyper_util::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{mpsc::Sender, Semaphore},
     task::JoinSet,
     time::timeout,
 };
+
+use crate::observation::{Observation, ObservationStats, RequestOutcome};
 
 /// Largest request or response body accepted by the proxy.
 pub const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -36,28 +46,125 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 type ProxyClient = Client<HttpConnector, Full<Bytes>>;
 
+#[derive(Clone)]
+struct Observer {
+    sender: Sender<Observation>,
+    stats: ObservationStats,
+}
+
+impl Observer {
+    fn emit(&self, observation: Observation) {
+        // Telemetry must never wait for capacity on the request path.
+        match self.sender.try_send(observation) {
+            Ok(()) => self.stats.record_enqueued(),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => self.stats.record_full(),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => self.stats.record_closed(),
+        }
+    }
+}
+
 /// Start a proxy on `listen_addr`, forwarding traffic to `backend_addr`.
 ///
 /// Pressing Ctrl-C stops accepting new connections and gives active
 /// connections up to two seconds to finish before they are cancelled.
 pub async fn run(listen_addr: SocketAddr, backend_addr: SocketAddr) -> std::io::Result<()> {
+    run_with_observer(
+        listen_addr,
+        backend_addr,
+        "default-service".to_string(),
+        None,
+    )
+    .await
+}
+
+/// Start a proxy on `listen_addr`, tagging emitted observations with `service_name`
+/// and forwarding them through `observer` channel if provided.
+///
+/// Delivery is best effort: full or closed channels drop observations without
+/// blocking requests. A dropped-record count is reported on shutdown. Records
+/// describe processing through response buffering, not delivery to the client.
+pub async fn run_with_observer(
+    listen_addr: SocketAddr,
+    backend_addr: SocketAddr,
+    service_name: String,
+    observer: Option<Sender<Observation>>,
+) -> std::io::Result<()> {
+    run_with_observer_and_stats(
+        listen_addr,
+        backend_addr,
+        service_name,
+        observer,
+        ObservationStats::default(),
+    )
+    .await
+}
+
+/// Run with a caller-owned stats handle for live snapshots of queue delivery.
+/// Use a fresh handle per run for per-run totals, or share one to aggregate runs.
+pub async fn run_with_observer_and_stats(
+    listen_addr: SocketAddr,
+    backend_addr: SocketAddr,
+    service_name: String,
+    observer: Option<Sender<Observation>>,
+    stats: ObservationStats,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(listen_addr).await?;
     let actual_addr = listener.local_addr()?;
     let client = build_client();
 
-    eprintln!(
+    crate::diagnostic!(
         "ExaProp proxy listening on http://{actual_addr}, forwarding to http://{backend_addr}"
     );
 
-    run_listener(listener, backend_addr, client, async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            eprintln!("Could not listen for Ctrl-C: {error}");
-        }
-    })
+    let service_name: Arc<str> = Arc::from(service_name);
+    run_listener(
+        listener,
+        backend_addr,
+        client,
+        service_name,
+        observer.map(|sender| Observer { sender, stats }),
+        shutdown_signal(),
+    )
     .await;
 
-    eprintln!("Proxy shutting down");
+    crate::diagnostic!("Proxy shutting down");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    crate::diagnostic!("Could not register SIGTERM: {error}");
+                    return;
+                }
+            };
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result { crate::diagnostic!("Could not listen for Ctrl-C: {error}"); }
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut ctrl_break = match tokio::signal::windows::ctrl_break() {
+            Ok(signal) => signal,
+            Err(error) => {
+                crate::diagnostic!("Could not register Ctrl-Break: {error}");
+                return;
+            }
+        };
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result { crate::diagnostic!("Could not listen for Ctrl-C: {error}"); }
+            }
+            _ = ctrl_break.recv() => {}
+        }
+    }
 }
 
 fn build_client() -> ProxyClient {
@@ -71,11 +178,37 @@ async fn run_listener<F>(
     listener: TcpListener,
     backend_addr: SocketAddr,
     client: ProxyClient,
+    service_name: Arc<str>,
+    observer: Option<Observer>,
+    shutdown: F,
+) where
+    F: Future<Output = ()> + Send,
+{
+    run_listener_with_timeout(
+        listener,
+        backend_addr,
+        client,
+        service_name,
+        observer,
+        IO_TIMEOUT,
+        shutdown,
+    )
+    .await;
+}
+
+async fn run_listener_with_timeout<F>(
+    listener: TcpListener,
+    backend_addr: SocketAddr,
+    client: ProxyClient,
+    service_name: Arc<str>,
+    observer: Option<Observer>,
+    io_timeout: Duration,
     shutdown: F,
 ) where
     F: Future<Output = ()> + Send,
 {
     tokio::pin!(shutdown);
+    let stats = observer.as_ref().map(|observer| observer.stats.clone());
     let permits = std::sync::Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connections = JoinSet::new();
 
@@ -102,18 +235,29 @@ async fn run_listener<F>(
 
         match accepted {
             Ok((stream, peer)) => {
-                eprintln!("Accepted client {peer}");
+                crate::diagnostic!("Accepted client {peer}");
                 let client = client.clone();
+                let service_name = service_name.clone();
+                let observer = observer.clone();
                 connections.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = serve_connection(stream, backend_addr, client).await {
-                        eprintln!("Connection from {peer} ended with an error: {error}");
+                    if let Err(error) = serve_connection(
+                        stream,
+                        backend_addr,
+                        client,
+                        service_name,
+                        observer,
+                        io_timeout,
+                    )
+                    .await
+                    {
+                        crate::diagnostic!("Connection from {peer} ended with an error: {error}");
                     }
                 });
             }
             Err(error) => {
                 drop(permit);
-                eprintln!("Could not accept client connection: {error}");
+                crate::diagnostic!("Could not accept client connection: {error}");
             }
         }
     }
@@ -127,21 +271,48 @@ async fn run_listener<F>(
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     }
+    if let Some(stats) = stats {
+        let snapshot = stats.snapshot();
+        crate::diagnostic!(
+            "observation_queue enqueued={} dropped={} full={} closed={}",
+            snapshot.enqueued,
+            snapshot.dropped(),
+            snapshot.dropped_full,
+            snapshot.dropped_closed
+        );
+    }
 }
 
 async fn serve_connection(
     stream: TcpStream,
     backend_addr: SocketAddr,
     client: ProxyClient,
+    service_name: Arc<str>,
+    observer: Option<Observer>,
+    io_timeout: Duration,
 ) -> Result<(), hyper::Error> {
     let service = service_fn(move |request| {
         let client = client.clone();
-        async move { Ok::<_, Infallible>(handle_request(request, backend_addr, client).await) }
+        let service_name = service_name.clone();
+        let observer = observer.clone();
+        async move {
+            Ok::<_, Infallible>(
+                handle_request(
+                    request,
+                    backend_addr,
+                    client,
+                    service_name,
+                    observer,
+                    io_timeout,
+                )
+                .await,
+            )
+        }
     });
 
     http1::Builder::new()
         .timer(TokioTimer::new())
-        .header_read_timeout(IO_TIMEOUT)
+        .header_read_timeout(io_timeout)
         .serve_connection(TokioIo::new(stream), service)
         .await
 }
@@ -150,79 +321,137 @@ async fn handle_request(
     request: Request<Incoming>,
     backend_addr: SocketAddr,
     client: ProxyClient,
+    service_name: Arc<str>,
+    observer: Option<Observer>,
+    io_timeout: Duration,
 ) -> Response<Full<Bytes>> {
+    let start_instant = Instant::now();
+    let start_timestamp = SystemTime::now();
+
+    let method = request.method().clone();
+    let version = request.version();
+    let raw_path_and_query = request
+        .uri()
+        .path_and_query()
+        .map_or("/", |value| value.as_str())
+        .to_string();
+
+    let emit = |status: StatusCode, outcome: RequestOutcome, response: Response<Full<Bytes>>| {
+        if let Some(ref tx) = observer {
+            let obs = Observation::new(
+                start_timestamp,
+                service_name.to_string(),
+                method.clone(),
+                &raw_path_and_query,
+                status,
+                start_instant.elapsed(),
+                outcome,
+            );
+            tx.emit(obs);
+        }
+        response
+    };
+
+    let mut headers = request.headers().clone();
+    let connection_upgrade = match strip_hop_by_hop_headers(&mut headers) {
+        Ok(upgrade) => upgrade,
+        Err(()) => {
+            return emit(
+                StatusCode::BAD_REQUEST,
+                RequestOutcome::Rejected,
+                error_response(StatusCode::BAD_REQUEST, "Invalid Connection header\n"),
+            );
+        }
+    };
+
     if request.method() == Method::CONNECT
         || request.headers().contains_key(UPGRADE)
-        || request
-            .headers()
-            .get(CONNECTION)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
-            })
+        || connection_upgrade
     {
-        return error_response(
+        return emit(
             StatusCode::NOT_IMPLEMENTED,
-            "HTTP upgrades are not supported\n",
+            RequestOutcome::Rejected,
+            error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "HTTP upgrades are not supported\n",
+            ),
         );
     }
 
     if request.headers().contains_key(EXPECT) {
-        return error_response(
+        return emit(
             StatusCode::EXPECTATION_FAILED,
-            "Expect headers are not supported\n",
+            RequestOutcome::Rejected,
+            error_response(
+                StatusCode::EXPECTATION_FAILED,
+                "Expect headers are not supported\n",
+            ),
         );
     }
 
     if request.headers().contains_key("trailer") {
-        return error_response(
+        return emit(
             StatusCode::NOT_IMPLEMENTED,
-            "HTTP trailers are not supported\n",
+            RequestOutcome::Rejected,
+            error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "HTTP trailers are not supported\n",
+            ),
         );
     }
 
-    let method = request.method().clone();
-    let version = request.version();
-    let path_and_query = request
-        .uri()
-        .path_and_query()
-        .map_or("/", |value| value.as_str());
-    let uri = match format!("http://{backend_addr}{path_and_query}").parse::<Uri>() {
+    let uri = match format!("http://{backend_addr}{raw_path_and_query}").parse::<Uri>() {
         Ok(uri) => uri,
         Err(error) => {
-            eprintln!("Could not construct backend URI: {error}");
-            return error_response(StatusCode::BAD_REQUEST, "Invalid request target\n");
+            crate::diagnostic!("Could not construct backend URI: {error}");
+            return emit(
+                StatusCode::BAD_REQUEST,
+                RequestOutcome::ClientFailure,
+                error_response(StatusCode::BAD_REQUEST, "Invalid request target\n"),
+            );
         }
     };
 
-    let mut headers = request.headers().clone();
-    strip_hop_by_hop_headers(&mut headers);
     headers.remove(CONTENT_LENGTH);
 
-    let body = match read_limited_body(request.into_body()).await {
+    let body = match read_limited_body_with_timeout(&mut request.into_body(), io_timeout).await {
         Ok(body) => body,
         Err(BodyReadError::TooLarge) => {
-            return error_response(
+            return emit(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "Request body exceeds 4 MiB\n",
+                RequestOutcome::Rejected,
+                error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Request body exceeds 4 MiB\n",
+                ),
             );
         }
         Err(BodyReadError::Timeout) => {
-            return error_response(
+            return emit(
                 StatusCode::REQUEST_TIMEOUT,
-                "Timed out reading request body\n",
+                RequestOutcome::ClientTimeout,
+                error_response(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "Timed out reading request body\n",
+                ),
             );
         }
         Err(BodyReadError::Trailers) => {
-            return error_response(
+            return emit(
                 StatusCode::NOT_IMPLEMENTED,
-                "HTTP trailers are not supported\n",
+                RequestOutcome::Rejected,
+                error_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "HTTP trailers are not supported\n",
+                ),
             );
         }
         Err(BodyReadError::Invalid) => {
-            return error_response(StatusCode::BAD_REQUEST, "Could not read request body\n");
+            return emit(
+                StatusCode::BAD_REQUEST,
+                RequestOutcome::ClientFailure,
+                error_response(StatusCode::BAD_REQUEST, "Could not read request body\n"),
+            );
         }
     };
     // RFC 9112 §6.2: A client SHOULD NOT send Content-Length when the request
@@ -232,6 +461,8 @@ async fn handle_request(
             headers.insert(CONTENT_LENGTH, length);
         }
     }
+
+    append_via(&mut headers, version);
 
     // Keep the client's Host header when present. It is often used by the
     // backend for virtual-host routing, while the URI authority selects where
@@ -247,46 +478,94 @@ async fn handle_request(
             request
         }
         Err(error) => {
-            eprintln!("Could not build backend request: {error}");
-            return error_response(StatusCode::BAD_REQUEST, "Could not build backend request\n");
+            crate::diagnostic!("Could not build backend request: {error}");
+            return emit(
+                StatusCode::BAD_REQUEST,
+                RequestOutcome::ClientFailure,
+                error_response(StatusCode::BAD_REQUEST, "Could not build backend request\n"),
+            );
         }
     };
 
-    let upstream = match timeout(IO_TIMEOUT, client.request(outbound)).await {
+    let upstream = match timeout(io_timeout, client.request(outbound)).await {
         Err(_) => {
-            return error_response(StatusCode::GATEWAY_TIMEOUT, "Backend request timed out\n")
+            return emit(
+                StatusCode::GATEWAY_TIMEOUT,
+                RequestOutcome::BackendTimeout,
+                error_response(StatusCode::GATEWAY_TIMEOUT, "Backend request timed out\n"),
+            );
         }
         Ok(Err(error)) => {
-            eprintln!("Backend request failed: {error}");
-            return error_response(StatusCode::BAD_GATEWAY, "Backend request failed\n");
+            crate::diagnostic!("Backend request failed: {error}");
+            return emit(
+                StatusCode::BAD_GATEWAY,
+                RequestOutcome::BackendFailure,
+                error_response(StatusCode::BAD_GATEWAY, "Backend request failed\n"),
+            );
         }
         Ok(Ok(response)) => response,
     };
 
     let status = upstream.status();
+    if status == StatusCode::SWITCHING_PROTOCOLS {
+        return emit(
+            StatusCode::BAD_GATEWAY,
+            RequestOutcome::BackendFailure,
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "Backend protocol switching is unsupported\n",
+            ),
+        );
+    }
     let version = upstream.version();
     let mut headers = upstream.headers().clone();
-    strip_hop_by_hop_headers(&mut headers);
+    if strip_hop_by_hop_headers(&mut headers).is_err() {
+        return emit(
+            StatusCode::BAD_GATEWAY,
+            RequestOutcome::BackendFailure,
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "Invalid backend Connection header\n",
+            ),
+        );
+    }
+    append_via(&mut headers, version);
 
-    let body = match read_limited_body(upstream.into_body()).await {
+    let body = match read_limited_body_with_timeout(&mut upstream.into_body(), io_timeout).await {
         Ok(body) => body,
         Err(BodyReadError::TooLarge) => {
-            return error_response(StatusCode::BAD_GATEWAY, "Backend response exceeds 4 MiB\n");
+            return emit(
+                StatusCode::BAD_GATEWAY,
+                RequestOutcome::BackendFailure,
+                error_response(StatusCode::BAD_GATEWAY, "Backend response exceeds 4 MiB\n"),
+            );
         }
         Err(BodyReadError::Timeout) => {
-            return error_response(
+            return emit(
                 StatusCode::GATEWAY_TIMEOUT,
-                "Timed out reading backend response\n",
+                RequestOutcome::BackendTimeout,
+                error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Timed out reading backend response\n",
+                ),
             );
         }
         Err(BodyReadError::Trailers) => {
-            return error_response(
+            return emit(
                 StatusCode::BAD_GATEWAY,
-                "Backend response trailers are unsupported\n",
+                RequestOutcome::BackendFailure,
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "Backend response trailers are unsupported\n",
+                ),
             );
         }
         Err(BodyReadError::Invalid) => {
-            return error_response(StatusCode::BAD_GATEWAY, "Could not read backend response\n");
+            return emit(
+                StatusCode::BAD_GATEWAY,
+                RequestOutcome::BackendFailure,
+                error_response(StatusCode::BAD_GATEWAY, "Could not read backend response\n"),
+            );
         }
     };
 
@@ -301,9 +580,12 @@ async fn handle_request(
         if let Ok(length) = HeaderValue::from_str(&body.len().to_string()) {
             headers.insert(CONTENT_LENGTH, length);
         }
-    } else if status == StatusCode::NO_CONTENT || status == StatusCode::RESET_CONTENT {
-        // RFC 9110 §15.3.5: 204 and 205 responses MUST NOT include Content-Length.
+    } else if status == StatusCode::NO_CONTENT {
+        // RFC 9110 §8.6 forbids Content-Length for 204, not for 205.
         headers.remove(CONTENT_LENGTH);
+    } else if status == StatusCode::RESET_CONTENT {
+        // A 205 has no content; explicit zero framing permits HTTP/1.1 reuse.
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
     }
 
     let response_body = if body_is_forbidden {
@@ -319,11 +601,15 @@ async fn handle_request(
     {
         Ok(mut response) => {
             *response.headers_mut() = headers;
-            response
+            emit(status, RequestOutcome::Success, response)
         }
         Err(error) => {
-            eprintln!("Could not build client response: {error}");
-            error_response(StatusCode::BAD_GATEWAY, "Invalid backend response\n")
+            crate::diagnostic!("Could not build client response: {error}");
+            emit(
+                StatusCode::BAD_GATEWAY,
+                RequestOutcome::BackendFailure,
+                error_response(StatusCode::BAD_GATEWAY, "Invalid backend response\n"),
+            )
         }
     }
 }
@@ -334,14 +620,6 @@ enum BodyReadError {
     Timeout,
     Trailers,
     Invalid,
-}
-
-async fn read_limited_body<B>(mut body: B) -> Result<Bytes, BodyReadError>
-where
-    B: Body<Data = Bytes> + Unpin,
-    B::Error: std::fmt::Display,
-{
-    read_limited_body_with_timeout(&mut body, IO_TIMEOUT).await
 }
 
 async fn read_limited_body_with_timeout<B>(
@@ -362,7 +640,7 @@ where
             break;
         };
         let frame = frame.map_err(|error| {
-            eprintln!("HTTP body read failed: {error}");
+            crate::diagnostic!("HTTP body read failed: {error}");
             BodyReadError::Invalid
         })?;
 
@@ -384,14 +662,20 @@ where
 /// Remove hop-by-hop headers, including headers nominated by `Connection`.
 /// These headers describe one transport connection and must not be forwarded
 /// unchanged through a proxy.
-fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
-    let nominated: Vec<HeaderName> = headers
-        .get_all(CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
-        .collect();
+/// Validate every Connection list member before changing the headers. Empty list
+/// members are ignored per RFC 9110 §5.6.1; only SP/HTAB are optional whitespace.
+/// Returns whether the valid list nominated an upgrade.
+fn strip_hop_by_hop_headers(headers: &mut HeaderMap) -> Result<bool, ()> {
+    let mut nominated = Vec::new();
+    for value in headers.get_all(CONNECTION) {
+        for token in value.to_str().map_err(|_| ())?.split(',') {
+            let token = token.trim_matches([' ', '\t']);
+            if !token.is_empty() {
+                nominated.push(HeaderName::from_bytes(token.as_bytes()).map_err(|_| ())?);
+            }
+        }
+    }
+    let upgrade = nominated.contains(&UPGRADE);
 
     for name in [
         "connection",
@@ -409,6 +693,17 @@ fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
     for name in nominated {
         headers.remove(name);
     }
+    Ok(upgrade)
+}
+
+/// Append received-protocol and a fixed pseudonym; never advertise local hosts,
+/// backend addresses, listen ports, service labels, or software versions.
+fn append_via(headers: &mut HeaderMap, version: Version) {
+    let via = match version {
+        Version::HTTP_10 => "1.0 exaprop",
+        _ => "1.1 exaprop", // This proxy accepts and forwards HTTP/1.x only.
+    };
+    headers.append(VIA, HeaderValue::from_static(via));
 }
 
 fn error_response(status: StatusCode, message: &'static str) -> Response<Full<Bytes>> {
@@ -436,13 +731,42 @@ mod tests {
     use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
     async fn start_proxy(backend: SocketAddr) -> (SocketAddr, oneshot::Sender<()>, JoinHandle<()>) {
+        start_proxy_with_timeout_and_observer(backend, "test-service", None, IO_TIMEOUT).await
+    }
+
+    async fn start_proxy_with_observer(
+        backend: SocketAddr,
+        service_name: &str,
+        observer: Option<Sender<Observation>>,
+    ) -> (SocketAddr, oneshot::Sender<()>, JoinHandle<()>) {
+        start_proxy_with_timeout_and_observer(backend, service_name, observer, IO_TIMEOUT).await
+    }
+
+    async fn start_proxy_with_timeout_and_observer(
+        backend: SocketAddr,
+        service_name: &str,
+        observer: Option<Sender<Observation>>,
+        io_timeout: Duration,
+    ) -> (SocketAddr, oneshot::Sender<()>, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let service_name: Arc<str> = Arc::from(service_name);
         let task = tokio::spawn(async move {
-            run_listener(listener, backend, build_client(), async {
-                let _ = shutdown_rx.await;
-            })
+            run_listener_with_timeout(
+                listener,
+                backend,
+                build_client(),
+                service_name,
+                observer.map(|sender| Observer {
+                    sender,
+                    stats: ObservationStats::default(),
+                }),
+                io_timeout,
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
             .await;
         });
         (address, shutdown_tx, task)
@@ -495,7 +819,257 @@ mod tests {
 
     async fn stop_server(tx: oneshot::Sender<()>, task: JoinHandle<()>) {
         let _ = tx.send(());
-        let _ = timeout(Duration::from_secs(4), task).await;
+        timeout(Duration::from_secs(4), task)
+            .await
+            .expect("server shutdown timed out")
+            .expect("server task panicked");
+    }
+
+    async fn next_observation(rx: &mut tokio::sync::mpsc::Receiver<Observation>) -> Observation {
+        timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("observation receive timed out")
+            .expect("observer channel closed prematurely")
+    }
+
+    async fn start_raw_backend(
+        raw: &'static [u8],
+    ) -> (SocketAddr, oneshot::Sender<()>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, mut stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.unwrap();
+                        tokio::spawn(async move {
+                            let mut request = Vec::new();
+                            let mut buffer = [0; 1024];
+                            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                                let read = timeout(Duration::from_secs(3), stream.read(&mut buffer)).await.unwrap().unwrap();
+                                if read == 0 { return; }
+                                request.extend_from_slice(&buffer[..read]);
+                                assert!(request.len() < 16384);
+                            }
+                            stream.write_all(raw).await.unwrap();
+                            stream.shutdown().await.unwrap();
+                        });
+                    }
+                }
+            }
+        });
+        (address, stop, task)
+    }
+
+    #[tokio::test]
+    async fn malformed_client_connection_headers_are_rejected_and_observed() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let (proxy, stop, task) = start_proxy_with_observer(
+            "127.0.0.1:1".parse().unwrap(),
+            "invalid-client",
+            Some(sender),
+        )
+        .await;
+        for invalid in [
+            b"x-private,\xff".as_slice(),
+            b"x-private bad",
+            b"\"x-private\"",
+            b"x-private:bad",
+        ] {
+            let mut client = TcpStream::connect(proxy).await.unwrap();
+            let mut bytes =
+                b"GET /invalid HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nConnection: "
+                    .to_vec();
+            bytes.extend_from_slice(invalid);
+            bytes.extend_from_slice(b"\r\nX-Private: must-not-forward\r\n\r\n");
+            client.write_all(&bytes).await.unwrap();
+            let mut response = Vec::new();
+            timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 400"));
+            let observation = next_observation(&mut receiver).await;
+            assert_eq!(observation.status, StatusCode::BAD_REQUEST);
+            assert_eq!(observation.outcome, RequestOutcome::Rejected);
+        }
+        stop_server(stop, task).await;
+    }
+
+    #[tokio::test]
+    async fn unsolicited_upstream_switch_is_a_backend_failure() {
+        let (backend, backend_stop, backend_task) = start_raw_backend(
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n"
+        ).await;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let (proxy, stop, task) =
+            start_proxy_with_observer(backend, "upstream-switch", Some(sender)).await;
+        let response = test_client()
+            .request(request(format!("http://{proxy}/switch"), Method::GET, b""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response.headers().contains_key(UPGRADE));
+        let observation = next_observation(&mut receiver).await;
+        assert_eq!(observation.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(observation.outcome, RequestOutcome::BackendFailure);
+        stop_server(stop, task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_upstream_connection_headers_are_backend_failures() {
+        for raw in [
+            b"HTTP/1.1 200 OK\r\nConnection: x-private,\xff\r\nContent-Length: 2\r\nX-Private: hidden\r\n\r\nok".as_slice(),
+            b"HTTP/1.1 200 OK\r\nConnection: \"x-private\"\r\nContent-Length: 2\r\n\r\nok",
+            b"HTTP/1.1 200 OK\r\nConnection: x private\r\nContent-Length: 2\r\n\r\nok",
+        ] {
+            let (backend, backend_stop, backend_task) = start_raw_backend(raw).await;
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            let (proxy, stop, task) = start_proxy_with_observer(backend, "invalid-upstream", Some(sender)).await;
+            let response = test_client().request(request(format!("http://{proxy}/bad"), Method::GET, b"")).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert!(!response.headers().contains_key("x-private"));
+            let observation = next_observation(&mut receiver).await;
+            assert_eq!(observation.outcome, RequestOutcome::BackendFailure);
+            stop_server(stop, task).await;
+            stop_server(backend_stop, backend_task).await;
+        }
+    }
+
+    #[test]
+    fn connection_lists_validate_atomically_and_accept_empty_members_and_ows() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            CONNECTION,
+            HeaderValue::from_static(", \tX-Private,, keep-alive ,"),
+        );
+        headers.append(CONNECTION, HeaderValue::from_static("X-Second"));
+        headers.insert("x-private", HeaderValue::from_static("remove"));
+        headers.insert("x-second", HeaderValue::from_static("remove"));
+        headers.insert("x-public", HeaderValue::from_static("keep"));
+        assert!(!strip_hop_by_hop_headers(&mut headers).unwrap());
+        assert!(!headers.contains_key("x-private"));
+        assert!(!headers.contains_key("x-second"));
+        assert_eq!(headers["x-public"], "keep");
+        headers.append(CONNECTION, HeaderValue::from_static("x-public"));
+        headers.append(CONNECTION, HeaderValue::from_static("invalid token"));
+        let original = headers.clone();
+        assert!(strip_hop_by_hop_headers(&mut headers).is_err());
+        assert_eq!(headers, original);
+    }
+
+    #[tokio::test]
+    async fn via_chains_host_and_duplicate_headers_survive_forwarding() {
+        let (backend, backend_stop, backend_task) = start_backend(|request| async move {
+            assert_eq!(request.headers()["host"], "customer.example");
+            let chain: Vec<_> = request
+                .headers()
+                .get_all(VIA)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            assert_eq!(chain, ["1.0 entry, 1.1 edge", "1.1 cache", "1.1 exaprop"]);
+            assert!(!request.headers().contains_key("x-private"));
+            let mut response = Response::new(Full::new(Bytes::from("ok")));
+            response
+                .headers_mut()
+                .append(VIA, HeaderValue::from_static("1.0 origin-gateway"));
+            response
+                .headers_mut()
+                .append("set-cookie", HeaderValue::from_static("one=1"));
+            response
+                .headers_mut()
+                .append("set-cookie", HeaderValue::from_static("two=2"));
+            response
+                .headers_mut()
+                .append(CONNECTION, HeaderValue::from_static("x-private"));
+            response
+                .headers_mut()
+                .insert("x-private", HeaderValue::from_static("hidden"));
+            response
+        })
+        .await;
+        let (proxy, stop, task) = start_proxy(backend).await;
+        let mut outbound = request(format!("http://{proxy}/via"), Method::GET, b"");
+        outbound
+            .headers_mut()
+            .insert("host", HeaderValue::from_static("customer.example"));
+        outbound
+            .headers_mut()
+            .append(VIA, HeaderValue::from_static("1.0 entry, 1.1 edge"));
+        outbound
+            .headers_mut()
+            .append(VIA, HeaderValue::from_static("1.1 cache"));
+        outbound
+            .headers_mut()
+            .append(CONNECTION, HeaderValue::from_static("x-private"));
+        outbound
+            .headers_mut()
+            .insert("x-private", HeaderValue::from_static("hidden"));
+        let response = test_client().request(outbound).await.unwrap();
+        let chain: Vec<_> = response
+            .headers()
+            .get_all(VIA)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(chain, ["1.0 origin-gateway", "1.1 exaprop"]);
+        assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+        assert!(!response.headers().contains_key("x-private"));
+        stop_server(stop, task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[test]
+    fn via_uses_received_protocol_and_a_non_sensitive_pseudonym() {
+        let mut headers = HeaderMap::new();
+        append_via(&mut headers, Version::HTTP_10);
+        assert_eq!(headers[VIA], "1.0 exaprop");
+        append_via(&mut headers, Version::HTTP_11);
+        assert_eq!(
+            headers.get_all(VIA).iter().next_back().unwrap(),
+            "1.1 exaprop"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_content_has_zero_length_framing_on_the_wire() {
+        let (backend, backend_stop, backend_task) = start_raw_backend(
+            b"HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let (proxy, stop, task) =
+            start_proxy_with_observer(backend, "reset-content", Some(sender)).await;
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(b"GET /reset HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 205"));
+        let boundary = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap();
+        let head = std::str::from_utf8(&response[..boundary]).unwrap();
+        assert!(head
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("content-length: 0")));
+        assert!(!head.to_ascii_lowercase().contains("transfer-encoding"));
+        assert!(response[boundary + 4..].is_empty());
+        let observation = next_observation(&mut receiver).await;
+        assert_eq!(observation.status, StatusCode::RESET_CONTENT);
+        assert_eq!(observation.outcome, RequestOutcome::Success);
+        stop_server(stop, task).await;
+        stop_server(backend_stop, backend_task).await;
     }
 
     #[tokio::test]
@@ -850,7 +1424,7 @@ mod tests {
         headers.insert("x-private", HeaderValue::from_static("remove"));
         headers.insert("x-end-to-end", HeaderValue::from_static("keep"));
 
-        strip_hop_by_hop_headers(&mut headers);
+        strip_hop_by_hop_headers(&mut headers).unwrap();
 
         assert!(!headers.contains_key(CONNECTION));
         assert!(!headers.contains_key("keep-alive"));
@@ -1044,5 +1618,518 @@ mod tests {
 
         stop_server(proxy_stop, proxy_task).await;
         stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn records_successful_get_observation() {
+        let (backend, backend_stop, backend_task) =
+            start_backend(|_| async { Response::new(Full::new(Bytes::from("hello_obs"))) }).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer(backend, "api-gateway", Some(tx)).await;
+
+        let res = test_client()
+            .request(request(
+                format!("http://{proxy}/items?page=1"),
+                Method::GET,
+                b"",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let obs = next_observation(&mut rx).await;
+        assert_eq!(obs.service_name, "api-gateway");
+        assert_eq!(obs.method, Method::GET);
+        assert_eq!(obs.path, "/items");
+        assert_eq!(obs.query.as_deref(), Some("page=1"));
+        assert_eq!(obs.status, StatusCode::OK);
+        assert_eq!(obs.outcome, RequestOutcome::Success);
+        assert!(obs.duration >= Duration::ZERO);
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn records_successful_post_observation() {
+        let (backend, backend_stop, backend_task) = start_backend(|req| async move {
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            Response::new(Full::new(body))
+        })
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer(backend, "orders-service", Some(tx)).await;
+
+        let res = test_client()
+            .request(request(
+                format!("http://{proxy}/orders"),
+                Method::POST,
+                b"order_id=42",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let obs = next_observation(&mut rx).await;
+        assert_eq!(obs.service_name, "orders-service");
+        assert_eq!(obs.method, Method::POST);
+        assert_eq!(obs.path, "/orders");
+        assert_eq!(obs.status, StatusCode::OK);
+        assert_eq!(obs.outcome, RequestOutcome::Success);
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn records_backend_500_as_completed_exchange() {
+        let (backend, backend_stop, backend_task) = start_backend(|_| async {
+            let mut res = Response::new(Full::new(Bytes::from("server_error")));
+            *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            res
+        })
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer(backend, "payment-svc", Some(tx)).await;
+
+        let res = test_client()
+            .request(request(format!("http://{proxy}/charge"), Method::POST, b""))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let obs = next_observation(&mut rx).await;
+        assert_eq!(obs.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(obs.outcome, RequestOutcome::Success);
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn distinguishes_backend_failure_from_backend_502() {
+        let dead_backend: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer(dead_backend, "dead-svc", Some(tx.clone())).await;
+
+        let res = test_client()
+            .request(request(format!("http://{proxy}/fail"), Method::GET, b""))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+
+        let obs_fail = next_observation(&mut rx).await;
+        assert_eq!(obs_fail.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(obs_fail.outcome, RequestOutcome::BackendFailure);
+
+        stop_server(proxy_stop, proxy_task).await;
+
+        let (backend, backend_stop, backend_task) = start_backend(|_| async {
+            let mut res = Response::new(Full::new(Bytes::from("deliberate_502")));
+            *res.status_mut() = StatusCode::BAD_GATEWAY;
+            res
+        })
+        .await;
+        let (proxy2, proxy_stop2, proxy_task2) =
+            start_proxy_with_observer(backend, "live-svc", Some(tx)).await;
+
+        let res2 = test_client()
+            .request(request(
+                format!("http://{proxy2}/upstream-502"),
+                Method::GET,
+                b"",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), StatusCode::BAD_GATEWAY);
+
+        let obs_live = next_observation(&mut rx).await;
+        assert_eq!(obs_live.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(obs_live.outcome, RequestOutcome::Success);
+
+        stop_server(proxy_stop2, proxy_task2).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn records_backend_timeout_observation() {
+        let (backend, backend_stop, backend_task) = start_backend(|_| async {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            Response::new(Full::new(Bytes::from("delayed_ok")))
+        })
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let (proxy, proxy_stop, proxy_task) = start_proxy_with_timeout_and_observer(
+            backend,
+            "timeout-svc",
+            Some(tx),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        let res = test_client()
+            .request(request(format!("http://{proxy}/timeout"), Method::GET, b""))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let obs = next_observation(&mut rx).await;
+        assert_eq!(obs.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(obs.outcome, RequestOutcome::BackendTimeout);
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn records_request_rejection_observation() {
+        let (backend, backend_stop, backend_task) =
+            start_backend(|_| async { Response::new(Full::new(Bytes::new())) }).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer(backend, "reject-svc", Some(tx)).await;
+
+        let mut req = request(format!("http://{proxy}/expect"), Method::POST, b"data");
+        req.headers_mut()
+            .insert(EXPECT, HeaderValue::from_static("100-continue"));
+        let res = test_client().request(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::EXPECTATION_FAILED);
+
+        let obs = next_observation(&mut rx).await;
+        assert_eq!(obs.status, StatusCode::EXPECTATION_FAILED);
+        assert_eq!(obs.outcome, RequestOutcome::Rejected);
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn captures_accurate_method_and_path() {
+        let (backend, backend_stop, backend_task) =
+            start_backend(|_| async { Response::new(Full::new(Bytes::from("path_ok"))) }).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer(backend, "catalog-svc", Some(tx)).await;
+
+        let res = test_client()
+            .request(request(
+                format!("http://{proxy}/catalog/v2/items/99"),
+                Method::GET,
+                b"",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let obs = next_observation(&mut rx).await;
+        assert_eq!(obs.method, Method::GET);
+        assert_eq!(obs.path, "/catalog/v2/items/99");
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn monotonic_duration_is_non_negative() {
+        let (backend, backend_stop, backend_task) = start_backend(|_| async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Response::new(Full::new(Bytes::from("sleep_ok")))
+        })
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer(backend, "latency-svc", Some(tx)).await;
+
+        let res = test_client()
+            .request(request(format!("http://{proxy}/latency"), Method::GET, b""))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let obs = next_observation(&mut rx).await;
+        assert!(obs.duration >= Duration::from_millis(4));
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn emits_exactly_one_observation_per_request() {
+        let (backend, backend_stop, backend_task) =
+            start_backend(|_| async { Response::new(Full::new(Bytes::from("ok"))) }).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer(backend, "single-svc", Some(tx)).await;
+
+        let client = test_client();
+        for i in 0..3 {
+            let res = client
+                .request(request(format!("http://{proxy}/req/{i}"), Method::GET, b""))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let obs = next_observation(&mut rx).await;
+            assert_eq!(obs.path, format!("/req/{i}"));
+        }
+
+        let extra = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(extra.is_err());
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_produce_independent_observations() {
+        let (backend, backend_stop, backend_task) = start_backend(|req| async move {
+            let path = req.uri().path().to_string();
+            Response::new(Full::new(Bytes::from(path)))
+        })
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(20);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer(backend, "concurrent-svc", Some(tx)).await;
+
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            let client = test_client();
+            let url = format!("http://{proxy}/conc/{i}");
+            handles.push(tokio::spawn(async move {
+                client
+                    .request(request(url, Method::GET, b""))
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        for handle in handles {
+            let res = handle.await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+
+        let mut received_paths = Vec::new();
+        for _ in 0..5 {
+            let obs = next_observation(&mut rx).await;
+            received_paths.push(obs.path);
+        }
+        received_paths.sort();
+        assert_eq!(
+            received_paths,
+            vec!["/conc/0", "/conc/1", "/conc/2", "/conc/3", "/conc/4"]
+        );
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn no_request_or_response_bodies_or_headers_recorded() {
+        let (backend, backend_stop, backend_task) = start_backend(|req| async move {
+            assert_eq!(req.headers()["authorization"], "Bearer private-header");
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body.as_ref(), b"private-request-body");
+            let mut response = Response::new(Full::new(Bytes::from("private-response-body")));
+            response
+                .headers_mut()
+                .insert("set-cookie", HeaderValue::from_static("private-cookie"));
+            response
+        })
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer(backend, "svc", Some(tx)).await;
+        let mut req = request(
+            format!("http://{proxy}/data"),
+            Method::POST,
+            b"private-request-body",
+        );
+        req.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_static("Bearer private-header"),
+        );
+        let response = test_client().request(req).await.unwrap();
+        assert_eq!(response.headers()["set-cookie"], "private-cookie");
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+            b"private-response-body"
+        );
+        let obs = next_observation(&mut rx).await;
+        assert_eq!(obs.method, Method::POST);
+        assert_eq!(obs.path, "/data");
+        assert!(!format!("{obs:?}").contains("private-"));
+        stop_server(proxy_stop, proxy_task).await;
+        assert!(timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .is_none());
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn redacts_sensitive_query_parameters() {
+        let (backend, backend_stop, backend_task) = start_backend(|req| async move {
+            assert_eq!(
+                req.uri().query(),
+                Some("%74oken=supersecret123&page=5&api_key=privkey")
+            );
+            Response::new(Full::new(Bytes::from("redacted_ok")))
+        })
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer(backend, "secure-svc", Some(tx)).await;
+
+        let res = test_client()
+            .request(request(
+                format!("http://{proxy}/account?%74oken=supersecret123&page=5&api_key=privkey"),
+                Method::GET,
+                b"",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let obs = next_observation(&mut rx).await;
+        assert_eq!(obs.path, "/account");
+        assert_eq!(
+            obs.query.as_deref(),
+            Some("%74oken=[REDACTED]&page=5&api_key=[REDACTED]")
+        );
+
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[test]
+    fn counts_full_and_closed_observer_drops() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let observer = Observer {
+            sender: tx,
+            stats: ObservationStats::default(),
+        };
+        let observation = Observation::new(
+            SystemTime::now(),
+            "svc".into(),
+            Method::GET,
+            "/",
+            StatusCode::OK,
+            Duration::ZERO,
+            RequestOutcome::Success,
+        );
+        observer.emit(observation.clone());
+        observer.emit(observation.clone());
+        assert_eq!(observer.stats.snapshot().dropped(), 1);
+        assert_eq!(observer.stats.snapshot().enqueued, 1);
+        assert_eq!(observer.stats.snapshot().dropped_full, 1);
+        drop(rx);
+        observer.emit(observation);
+        assert_eq!(observer.stats.snapshot().dropped(), 2);
+        assert_eq!(observer.stats.snapshot().dropped_closed, 1);
+    }
+
+    #[tokio::test]
+    async fn full_and_closed_observers_do_not_block_forwarding() {
+        let (backend, backend_stop, backend_task) =
+            start_backend(|_| async { Response::new(Full::new(Bytes::from("healthy"))) }).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer(backend, "svc", Some(tx)).await;
+        let client = test_client();
+        for i in 0..3 {
+            let response = timeout(
+                Duration::from_secs(3),
+                client.request(request(format!("http://{proxy}/{i}"), Method::GET, b"")),
+            )
+            .await
+            .expect("telemetry blocked forwarding")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                "healthy"
+            );
+        }
+        assert_eq!(next_observation(&mut rx).await.path, "/0");
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        let response = timeout(
+            Duration::from_secs(3),
+            client.request(request(format!("http://{proxy}/closed"), Method::GET, b"")),
+        )
+        .await
+        .expect("closed observer blocked forwarding")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(client);
+        stop_server(proxy_stop, proxy_task).await;
+        stop_server(backend_stop, backend_task).await;
+    }
+
+    #[tokio::test]
+    async fn records_client_body_timeout() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (proxy, proxy_stop, proxy_task) = start_proxy_with_timeout_and_observer(
+            "127.0.0.1:1".parse().unwrap(),
+            "svc",
+            Some(tx),
+            Duration::from_millis(200),
+        )
+        .await;
+        let mut stream = TcpStream::connect(proxy).await.unwrap();
+        stream
+            .write_all(b"POST /slow HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\nx")
+            .await
+            .unwrap();
+        let observation = next_observation(&mut rx).await;
+        assert_eq!(observation.status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(observation.outcome, RequestOutcome::ClientTimeout);
+        drop(stream);
+        stop_server(proxy_stop, proxy_task).await;
+    }
+
+    #[tokio::test]
+    async fn records_rejected_oversized_body() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer("127.0.0.1:1".parse().unwrap(), "svc", Some(tx)).await;
+        let response = test_client()
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{proxy}/large"))
+                    .body(Full::new(Bytes::from(vec![b'x'; MAX_BODY_BYTES + 1])))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let observation = next_observation(&mut rx).await;
+        assert_eq!(observation.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(observation.outcome, RequestOutcome::Rejected);
+        stop_server(proxy_stop, proxy_task).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_upgrade_token_in_additional_connection_header() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (proxy, proxy_stop, proxy_task) =
+            start_proxy_with_observer("127.0.0.1:1".parse().unwrap(), "svc", Some(tx)).await;
+        let mut stream = TcpStream::connect(proxy).await.unwrap();
+        stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\nConnection: upgrade\r\n\r\n").await.unwrap();
+        let observation = next_observation(&mut rx).await;
+        assert_eq!(observation.status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(observation.outcome, RequestOutcome::Rejected);
+        drop(stream);
+        stop_server(proxy_stop, proxy_task).await;
     }
 }
