@@ -8,11 +8,11 @@ use std::time::{Duration, SystemTime};
 pub enum RequestOutcome {
     /// Upstream exchange completed normally (even if status is 4xx or 5xx).
     Success,
-    /// Upstream backend connection refused, reset, or broken before response headers.
+    /// Upstream connection or response body failed, or violated proxy constraints.
     BackendFailure,
     /// Upstream backend connect or read exceeded deadline.
     BackendTimeout,
-    /// Client disconnected prematurely, timed out, or sent malformed bytes.
+    /// Client request body failed after HTTP headers were parsed.
     ClientFailure,
     /// Client body read exceeded timeout.
     ClientTimeout,
@@ -29,7 +29,7 @@ pub struct Observation {
     pub service_name: String,
     /// HTTP method (GET, POST, etc.).
     pub method: Method,
-    /// Request URI path.
+    /// Request URI path, preserved verbatim. May contain sensitive identifiers.
     pub path: String,
     /// Sanitized query string with sensitive values redacted.
     pub query: Option<String>,
@@ -42,7 +42,7 @@ pub struct Observation {
 }
 
 impl Observation {
-    /// Create a new observation record, automatically sanitizing the path and query.
+    /// Create a record, preserving the path and redacting recognized query values.
     pub fn new(
         timestamp: SystemTime,
         service_name: String,
@@ -102,7 +102,30 @@ pub fn sanitize_query(query: &str) -> String {
 }
 
 fn is_sensitive_key(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
+    // Match form-encoded names as the backend would see them. Preserve the
+    // original spelling in the observation; only decode for classification.
+    // Malformed escapes are redacted conservatively rather than risking a leak.
+    let mut decoded = Vec::with_capacity(key.len());
+    let mut bytes = key.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'%' => {
+                let Some(high) = bytes.next().and_then(hex_digit) else {
+                    return true;
+                };
+                let Some(low) = bytes.next().and_then(hex_digit) else {
+                    return true;
+                };
+                decoded.push(high * 16 + low);
+            }
+            b'+' => decoded.push(b' '),
+            other => decoded.push(other),
+        }
+    }
+    let Ok(decoded) = String::from_utf8(decoded) else {
+        return true;
+    };
+    let lower = decoded.to_ascii_lowercase();
     lower.contains("token")
         || lower.contains("key")
         || lower.contains("secret")
@@ -113,6 +136,15 @@ fn is_sensitive_key(key: &str) -> bool {
         || lower.contains("sig")
         || lower.contains("bearer")
         || lower.contains("cred")
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -136,5 +168,33 @@ mod tests {
         let (path, query) = split_and_sanitize_path_and_query(raw);
         assert_eq!(path, "/health");
         assert_eq!(query, None);
+    }
+
+    #[test]
+    fn redacts_encoded_case_insensitive_and_duplicate_keys() {
+        assert_eq!(
+            sanitize_query("%74oken=secret&API%5fKEY=hidden&token=again&token&page=2"),
+            "%74oken=[REDACTED]&API%5fKEY=[REDACTED]&token=[REDACTED]&token=[REDACTED]&page=2"
+        );
+    }
+
+    #[test]
+    fn conservatively_redacts_malformed_parameter_names() {
+        for query in ["%=secret", "%7=secret", "%GG=secret", "%FF=secret"] {
+            assert!(sanitize_query(query).ends_with("=[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn preserves_non_sensitive_values_and_empty_query_structure() {
+        assert_eq!(sanitize_query(""), "");
+        assert_eq!(
+            sanitize_query("page=1&&sort=a%26b&flag&"),
+            "page=1&&sort=a%26b&flag&"
+        );
+        assert_eq!(
+            split_and_sanitize_path_and_query("/items?"),
+            ("/items".into(), Some(String::new()))
+        );
     }
 }
