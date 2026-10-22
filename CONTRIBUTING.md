@@ -25,6 +25,16 @@ cd exaprop
 
 Install the current stable Rust toolchain through `rustup`.
 
+The repository includes `rust-toolchain.toml`, which selects stable Rust with rustfmt and Clippy. Open a new terminal after installing Rust so the updated PATH is available. Confirm the installation with `rustup show`, `rustc --version`, and `cargo --version`.
+
+On Windows, the full check sequence is available as:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1
+```
+
+This script checks formatting, compilation, tests, Clippy, debug and release builds, and documentation. It stops at the first failure without changing the computer's persistent execution policy.
+
 Before submitting changes, run:
 
 ```bash
