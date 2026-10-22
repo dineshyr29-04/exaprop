@@ -1,8 +1,10 @@
 # Repository standards engineering report
 
-Date: 22 October 2026. Base: `main` / `origin/main` at `c63747f322a241328dc704046feefae323193536`. Working branch: `chore/repository-standards`, created from the clean, freshly fetched main branch. No commit, push, merge, tag, release, force-push, or remote-settings change was performed in this maintenance pass. The initial fast-forward check reported main already up to date.
+Initial audit date: 22 October 2026. Base: `main` / `origin/main` at `c63747f322a241328dc704046feefae323193536`. Working branch: `chore/repository-standards`, created from the clean, freshly fetched main branch. The initial audit and local validation preceded publication; they did not commit or push changes. The initial fast-forward check reported main already up to date.
 
-This is the pre-publication review snapshot. The user subsequently authorized focused commits and pushing this branch; Git history records that separate publication step. The validation results below describe the reviewed file contents.
+The user subsequently authorized six focused commits and pushing this branch. The published tip, `93c8293ba4a467b8dcfceecedcc38a97050af73f`, passed [GitHub Actions run 39784417419](https://github.com/dineshyr29-04/exaprop/actions/runs/39784417419). The branch awaits pull request review and merge; no PR was open when rechecked. The original local evidence below is preserved separately from that later publication and hosted verification.
+
+This final refinement updates the report and removes duplicate push/PR CI scheduling. These follow-up edits are uncommitted and have not run on GitHub Actions. No remote settings were changed.
 
 ## Audit findings
 
@@ -42,7 +44,7 @@ Contribution instructions distinguish Rust checks from Python smoke tests and gi
 
 ## CI changes and verification coverage
 
-The existing two-OS matrix, 15-minute timeout, manual dispatch, push/PR triggers, formatting, locked compilation/tests/Clippy/release/doc builds, strict documentation warnings, full FastAPI timeout campaign, HTTP protocol review, and always-attempted smoke artifact upload are retained.
+The existing two-OS matrix, 15-minute timeout, manual dispatch, formatting, locked compilation/tests/Clippy/release/doc builds, strict documentation warnings, full FastAPI timeout campaign, HTTP protocol review, and always-attempted smoke artifact upload are retained. Automatic runs now cover pushes to `main` and all pull requests, including forks. Feature-branch push runs are omitted to avoid duplicating the full matrix for internal PRs; before a PR exists, use local checks or manual dispatch.
 
 New concurrency cancels superseded runs for the same PR or branch. The token remains `contents: read`; checkout no longer persists credentials. No workflow executes untrusted PR code under `pull_request_target`. No project secret, hosted ExaProp service, publishing step, or deployment step is introduced. Removing the greeting workflow removes its privileged metadata-writing job as well.
 
@@ -59,7 +61,7 @@ Action versions and full SHAs were resolved through the official repositories' G
 
 These Node 24 actions require current runners; the workflow uses GitHub-hosted latest Linux/Windows runners. Self-hosted runners and GitHub Enterprise Server compatibility are not claimed. Dependabot will propose weekly updates after the configuration is merged; maintainers still need to review version comments, release notes, and CI.
 
-## Validation results
+## Original local validation results
 
 Local environment: Windows x86-64 GNU Rust 1.99.1, Python 3.12.14. The existing `scripts/check.ps1` was executed with the installed Rust tools on PATH and `CARGO_INCREMENTAL=0`. It ran these commands without weakening assertions or warnings:
 
@@ -83,12 +85,24 @@ The HTTP stderr checks again completed 600/600 requests while diagnostics were u
 
 Local evidence remains ignored: `tmp/repository-standards/rust-checks.log`, the metadata-validation script, `tmp/fastapi-smoke/20261022-161834-52724/`, and `tmp/http-review/20261022-161835-59900/`. The temporary actionlint ZIP was checked against its published SHA-256 list before extraction. The YAML 1.2 parser was installed only under ignored temporary tooling; no project or smoke dependency file changed.
 
-No requested local check was skipped or failed. Hosted CI execution, the GitHub issue-form UI, and actual Dependabot PR creation were not run for this uncommitted branch. Static validation does not substitute for those hosted checks.
+No requested local check was skipped or failed in the initial audit. Hosted CI had not yet run at that stage; it subsequently passed for published commit `93c8293` as recorded above. The GitHub issue-form UI and actual Dependabot PR creation were not exercised. Static validation does not substitute for those hosted checks.
+
+## Final refinement verification
+
+The follow-up fetch confirmed that the clean starting branch matched `origin/chore/repository-standards` and included current `origin/main` at `c63747f`. GitHub reported both `Verify (ubuntu-latest)` and `Verify (windows-latest)` successful for published commit `93c8293`. Private vulnerability reporting was rechecked and still returned `enabled: false`; the existing SECURITY.md warning and required maintainer action remain accurate. No PR was open.
+
+Only three files change in this refinement: `.github/workflows/ci.yml` restricts push events to main; CONTRIBUTING.md explains PR/manual verification for feature branches; this report separates the initial audit, later authorized publication, successful hosted results, and pending follow-up publication. The original evidence above is unchanged. The other reviewed documentation and templates required no correction.
+
+Final local checks passed again: every Rust command listed above through `scripts/check.ps1` (57 tests, strict Clippy/rustdoc, debug/release builds); actionlint 1.7.12; YAML 1.2 and issue-form validation; 83 relative Markdown links/anchors; and `git diff --check`. The metadata validator additionally confirms that the complete verification jobs, permissions, and concurrency configuration are identical to the published workflow. Main push, unfiltered PRs including forks, and manual dispatch remain enabled. No runtime or M3 regression source changed against either HEAD or origin/main.
+
+Both full smoke suites passed again. FastAPI checked 37 requests and 38 observations in 36.203 seconds, including both deliberate timeout paths and the broken-stdout scenario. HTTP review passed 16 protocol requests, Via/205/connection-reuse assertions, the echo backend, and all stderr modes: 600 completed requests with drainage resumed and 219 diagnostic drops, 600 with stderr blocked through bounded shutdown, and ten with stderr closed. New ignored evidence: `tmp/repository-standards/refinement-rust-checks.log`, `tmp/fastapi-smoke/20261022-225107-50040/`, and `tmp/http-review/20261022-225105-28456/`.
+
+The scheduling change avoids a second matrix for internal PR updates; it is not a benchmark or a claim that an individual test run becomes faster. No test, platform, timeout case, or assertion was removed. These uncommitted refinements have not themselves run on hosted CI and await approved publication, PR review, and merge.
 
 ## Remaining risks and maintainer decisions
 
 1. Private vulnerability reporting is disabled and there is no published fallback contact. A maintainer must enable it or supply a verified private channel and update the dated policy statement. This is explicitly documented, not silently treated as solved. No repository settings were changed.
-2. Hosted Linux and Windows CI must pass after an approved push/PR. Local Windows GNU results do not establish Linux/MSVC or macOS execution. Fork execution and action upgrades are statically reviewed, not exercised by creating an external PR.
+2. Hosted CI passed for the published branch tip, including Linux and Windows verification. The final uncommitted trigger/documentation refinements still require a hosted run after an approved publication. macOS and actual external-fork PR execution are not claimed.
 3. Stable Rust and hosted runner images still move over time. An exact compiler pin, tested MSRV, formal supported-version policy, and branch-protection rules remain maintainer choices; none was invented here.
 4. Existing M3 limitations remain: plain HTTP, buffered bodies, finite best-effort telemetry, heuristic privacy, and no anomaly detector or fault injection. This maintenance pass is not a new runtime security audit or production-readiness certification.
 
@@ -96,11 +110,11 @@ No requested local check was skipped or failed. Hosted CI execution, the GitHub 
 
 All 11 changed/created/deleted files were reviewed. Rust source, regression tests, Python fixtures/harnesses, manifests, Cargo.lock, toolchain selection, ignore rules, Code of Conduct, and Apache license are unchanged. M3 verification coverage is retained; only the unrelated stale greeting workflow is removed. No M4 behavior or deployment machinery was introduced. There are no generated files or credentials in the intended change set.
 
-**Ready for a pull request and maintainer review.** Merge should follow successful hosted CI and a maintainer decision on the documented private-reporting gap. No commit or push has been performed.
+**Published branch passed GitHub Actions and awaits pull request review and merge.** The final refinement is ready for review but remains uncommitted; rerun hosted CI after it is published with approval. Merge also requires a maintainer decision on the documented private-reporting gap. The initial audit did not perform the later authorized commits or push, and this final refinement has not committed, pushed, merged, or changed settings.
 
-## Proposed commit and pull request
+## Original commit proposal and current pull request draft
 
-Conventional commit:
+Original conventional commit proposal (publication subsequently used six focused commits):
 
 ```text
 chore(repo): align documentation, CI, and contributor workflows after M3
@@ -120,4 +134,4 @@ Proposed PR description:
 >
 > Validation passed locally on Windows GNU: formatting, locked check/test/debug/release builds, strict all-target/all-feature Clippy, strict rustdoc, 57 Rust tests, full FastAPI smoke, HTTP/blocked-output smoke, actionlint, YAML 1.2/issue-form checks, Markdown links/anchors, and diff checks. Runtime source, test coverage, dependencies, and license are unchanged.
 >
-> Reviewer attention: private vulnerability reporting is disabled and no fallback private contact is published. SECURITY.md flags the maintainer action rather than inventing a contact or support promise. Hosted CI remains required before merge.
+> Reviewer attention: private vulnerability reporting is disabled and no fallback private contact is published. SECURITY.md flags the maintainer action rather than inventing a contact or support promise. The published tip passed hosted CI; the final trigger/documentation refinements need a new hosted run after publication. The branch awaits PR review and merge.
