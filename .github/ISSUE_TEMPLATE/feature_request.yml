@@ -1,42 +1,42 @@
-name: ✨ Feature Request
-description: Propose a new feature, capability, or resilience simulation module
-labels: ["enhancement", "discussion"]
+name: Feature request
+description: Propose an ExaProp improvement with a concrete use case
+labels: [enhancement]
 body:
   - type: markdown
     attributes:
       value: |
-        Thank you for suggesting an idea to make FaultLab better!
+        Distinguish current functionality from roadmap proposals.
+        Use synthetic examples and omit private infrastructure details or credentials.
   - type: textarea
     id: problem
     attributes:
-      label: Problem Statement / Use Case
-      description: Is your feature request related to a specific challenge or limitation?
-      placeholder: "I'm always frustrated when..."
+      label: Problem or use case
+      description: What task is difficult with the current implementation?
     validations:
       required: true
   - type: textarea
-    id: solution
+    id: proposal
     attributes:
-      label: Proposed Solution / Design
-      description: Describe the solution or new feature you would like to see.
-      placeholder: Detailed description of proposed API, CLI flag, or architecture...
+      label: Proposed behavior
+      description: Describe the desired outcome and a concrete CLI, API, or workflow example if useful.
     validations:
       required: true
   - type: textarea
     id: alternatives
     attributes:
-      label: Considered Alternatives
-      description: Any alternative solutions, patterns, or workarounds you've explored.
-  - type: dropdown
-    id: area
+      label: Alternative approaches
+      description: Existing features, workarounds, other tools, or doing nothing.
+  - type: textarea
+    id: compatibility
     attributes:
-      label: Component / Area
+      label: Scope and compatibility
+      description: Consider HTTP semantics, observation privacy, resource bounds, platforms, and existing users. State uncertainties.
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Would you like to contribute?
       options:
-        - Core Engine / State Modeling
-        - Chaos / Fault Injection
-        - Incident Investigation / Timeline
-        - CLI & Tooling
-        - Documentation & Examples
-        - Other
-    validations:
-      required: true
+        - Not sure yet
+        - I can help implement this
+        - I can help test or document this
+        - I am sharing a use case only
