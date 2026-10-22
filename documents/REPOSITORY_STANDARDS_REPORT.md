@@ -2,9 +2,9 @@
 
 Initial audit date: 22 October 2026. Base: `main` / `origin/main` at `c63747f322a241328dc704046feefae323193536`. Working branch: `chore/repository-standards`, created from the clean, freshly fetched main branch. The initial audit and local validation preceded publication; they did not commit or push changes. The initial fast-forward check reported main already up to date.
 
-The user subsequently authorized six focused commits and pushing this branch. The published tip, `93c8293ba4a467b8dcfceecedcc38a97050af73f`, passed [GitHub Actions run 39784417419](https://github.com/dineshyr29-04/exaprop/actions/runs/39784417419). The branch awaits pull request review and merge; no PR was open when rechecked. The original local evidence below is preserved separately from that later publication and hosted verification.
+The user subsequently authorized six focused commits and pushing this branch. That initial published tip, `93c8293ba4a467b8dcfceecedcc38a97050af73f`, passed [GitHub Actions run 39784417419](https://github.com/dineshyr29-04/exaprop/actions/runs/39784417419). The branch awaits pull request review and merge; no PR was open when rechecked. The original local evidence below is preserved separately from that later publication and hosted verification.
 
-This final refinement updates the report and removes duplicate push/PR CI scheduling. These follow-up edits are uncommitted and have not run on GitHub Actions. No remote settings were changed.
+The follow-up refinements were subsequently committed and pushed as `d1a988e` (CI trigger refinement) and `f667fae` (documentation reconciliation). The latest published tip, `f667fae`, still requires its own hosted verification through a pull request or manual workflow dispatch; run 39784417419 verifies only `93c8293`. No remote settings were changed.
 
 ## Audit findings
 
@@ -91,18 +91,18 @@ No requested local check was skipped or failed in the initial audit. Hosted CI h
 
 The follow-up fetch confirmed that the clean starting branch matched `origin/chore/repository-standards` and included current `origin/main` at `c63747f`. GitHub reported both `Verify (ubuntu-latest)` and `Verify (windows-latest)` successful for published commit `93c8293`. Private vulnerability reporting was rechecked and still returned `enabled: false`; the existing SECURITY.md warning and required maintainer action remain accurate. No PR was open.
 
-Only three files change in this refinement: `.github/workflows/ci.yml` restricts push events to main; CONTRIBUTING.md explains PR/manual verification for feature branches; this report separates the initial audit, later authorized publication, successful hosted results, and pending follow-up publication. The original evidence above is unchanged. The other reviewed documentation and templates required no correction.
+Only three files changed in the published refinement: `.github/workflows/ci.yml` restricts push events to main; CONTRIBUTING.md explains PR/manual verification for feature branches; this report separates the initial audit, later authorized publication, and commit-specific hosted results. The original evidence above is unchanged. The other reviewed documentation and templates required no correction.
 
 Final local checks passed again: every Rust command listed above through `scripts/check.ps1` (57 tests, strict Clippy/rustdoc, debug/release builds); actionlint 1.7.12; YAML 1.2 and issue-form validation; 83 relative Markdown links/anchors; and `git diff --check`. The metadata validator additionally confirms that the complete verification jobs, permissions, and concurrency configuration are identical to the published workflow. Main push, unfiltered PRs including forks, and manual dispatch remain enabled. No runtime or M3 regression source changed against either HEAD or origin/main.
 
 Both full smoke suites passed again. FastAPI checked 37 requests and 38 observations in 36.203 seconds, including both deliberate timeout paths and the broken-stdout scenario. HTTP review passed 16 protocol requests, Via/205/connection-reuse assertions, the echo backend, and all stderr modes: 600 completed requests with drainage resumed and 219 diagnostic drops, 600 with stderr blocked through bounded shutdown, and ten with stderr closed. New ignored evidence: `tmp/repository-standards/refinement-rust-checks.log`, `tmp/fastapi-smoke/20261022-225107-50040/`, and `tmp/http-review/20261022-225105-28456/`.
 
-The scheduling change avoids a second matrix for internal PR updates; it is not a benchmark or a claim that an individual test run becomes faster. No test, platform, timeout case, or assertion was removed. These uncommitted refinements have not themselves run on hosted CI and await approved publication, PR review, and merge.
+The scheduling change avoids a second matrix for internal PR updates; it is not a benchmark or a claim that an individual test run becomes faster. No test, platform, timeout case, or assertion was removed. These refinements are published through `f667fae` and await their own hosted verification, PR review, and merge.
 
 ## Remaining risks and maintainer decisions
 
 1. Private vulnerability reporting is disabled and there is no published fallback contact. A maintainer must enable it or supply a verified private channel and update the dated policy statement. This is explicitly documented, not silently treated as solved. No repository settings were changed.
-2. Hosted CI passed for the published branch tip, including Linux and Windows verification. The final uncommitted trigger/documentation refinements still require a hosted run after an approved publication. macOS and actual external-fork PR execution are not claimed.
+2. Hosted CI passed for `93c8293`, including Linux and Windows verification. Latest published commit `f667fae` still requires its own hosted run through a PR or manual workflow dispatch. macOS and actual external-fork PR execution are not claimed.
 3. Stable Rust and hosted runner images still move over time. An exact compiler pin, tested MSRV, formal supported-version policy, and branch-protection rules remain maintainer choices; none was invented here.
 4. Existing M3 limitations remain: plain HTTP, buffered bodies, finite best-effort telemetry, heuristic privacy, and no anomaly detector or fault injection. This maintenance pass is not a new runtime security audit or production-readiness certification.
 
@@ -110,7 +110,7 @@ The scheduling change avoids a second matrix for internal PR updates; it is not 
 
 All 11 changed/created/deleted files were reviewed. Rust source, regression tests, Python fixtures/harnesses, manifests, Cargo.lock, toolchain selection, ignore rules, Code of Conduct, and Apache license are unchanged. M3 verification coverage is retained; only the unrelated stale greeting workflow is removed. No M4 behavior or deployment machinery was introduced. There are no generated files or credentials in the intended change set.
 
-**Published branch passed GitHub Actions and awaits pull request review and merge.** The final refinement is ready for review but remains uncommitted; rerun hosted CI after it is published with approval. Merge also requires a maintainer decision on the documented private-reporting gap. The initial audit did not perform the later authorized commits or push, and this final refinement has not committed, pushed, merged, or changed settings.
+**The branch is published through `f667fae` and awaits hosted verification of that commit, pull request review, and merge.** Local validation passed; GitHub Actions run 39784417419 passed only for `93c8293`. Merge also requires a maintainer decision on the documented private-reporting gap. The initial audit did not perform the later authorized commits or pushes; no merge or settings change was performed during the maintenance work.
 
 ## Original commit proposal and current pull request draft
 
@@ -134,4 +134,4 @@ Proposed PR description:
 >
 > Validation passed locally on Windows GNU: formatting, locked check/test/debug/release builds, strict all-target/all-feature Clippy, strict rustdoc, 57 Rust tests, full FastAPI smoke, HTTP/blocked-output smoke, actionlint, YAML 1.2/issue-form checks, Markdown links/anchors, and diff checks. Runtime source, test coverage, dependencies, and license are unchanged.
 >
-> Reviewer attention: private vulnerability reporting is disabled and no fallback private contact is published. SECURITY.md flags the maintainer action rather than inventing a contact or support promise. The published tip passed hosted CI; the final trigger/documentation refinements need a new hosted run after publication. The branch awaits PR review and merge.
+> Reviewer attention: private vulnerability reporting is disabled and no fallback private contact is published. SECURITY.md flags the maintainer action rather than inventing a contact or support promise. Run 39784417419 passed for `93c8293`; latest published commit `f667fae` needs its own hosted verification through a PR or manual dispatch. The branch awaits PR review and merge.
