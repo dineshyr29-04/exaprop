@@ -2,6 +2,8 @@
 
 Review date: 22 October 2026 (Asia/Calcutta)
 
+Historical verification snapshot: later refinements to counters, privacy, signal handling, and real-backend checks are defined in the current [M3 observation contract](../documents/M3_OBSERVABILITY.md). The test counts and limitations below describe the original review, not a replacement for current run results.
+
 ## Scope and repository state
 
 - Branch: `m3-observability`.
@@ -77,7 +79,7 @@ The suite exercises:
 2. **Observation boundary:** duration ends at response buffering, not client delivery. Parser-level rejections and cancelled handlers may have no observation. Response status records the proxy's selected response, not proof that the client received it.
 3. **Privacy scope:** paths and unrecognized query values remain visible. Redaction uses a heuristic and a single form-decoding pass, not configurable allowlisting or comprehensive secret detection. Headers and bodies are excluded from observations, but the proxy necessarily processes them while forwarding.
 4. **Timeout semantics:** body timeouts reset for each frame. There is no overall transaction deadline. A sufficiently slow but progressing stream can occupy a connection for longer than 15 seconds.
-5. **Output lifecycle:** draining is bounded; a blocked stdout sink may lose queued records at exit. Operational stderr logging is still synchronous. The output-drain unit test does not simulate every OS pipe-blocking or console Ctrl+C timing condition.
+5. **Output lifecycle (historical finding, fixed in final review):** draining is bounded; a blocked stdout sink may lose queued records at exit. Operational stderr was synchronous at this review point. The [final report](../documents/M3_FINAL_ENGINEERING_REPORT.md) records its replacement with bounded nonblocking diagnostics and actual blocked-pipe regressions.
 6. **Protocol scope:** plain HTTP/1.1, one backend, fully buffered bodies, and unsupported upgrades/trailers remain the current contract. Broader protocol conformance is not established by this suite.
 7. **M3 scope:** no anomaly detector, persistent exporter, cross-service causal correlation, or user-facing dashboard is implemented. Fault injection and propagation scoring remain later work.
 8. **Verification scope:** local results cover Windows GNU. Linux and Windows hosted CI are configured but have not run for these local changes. No load benchmark, fuzz campaign, dependency vulnerability audit, or production-readiness certification was performed.

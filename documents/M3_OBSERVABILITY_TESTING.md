@@ -6,13 +6,15 @@ Branch: `m3-observability`
 
 Purpose: explain the current M3 implementation and provide reproducible tests against the compiled application.
 
+For the current latency, counter, shutdown, and privacy definitions, see the [M3 observation contract](M3_OBSERVABILITY.md). A runnable real FastAPI campaign is available as [scripts/smoke_fastapi.py](../scripts/smoke_fastapi.py); this guide's additional manual experiments remain separate checks.
+
 ## 1. Scope and verification status
 
 M3 currently adds structured HTTP request observations to the bounded HTTP/1.1 proxy. It does not yet implement anomaly detection, durable telemetry storage, cross-service tracing, or a dashboard.
 
 **Already verified locally:** all 46 Rust tests, formatting, compilation, Clippy with warnings denied, debug/release builds, documentation checks, CLI help, invalid address handling, and occupied-port startup handling. The complete development check script also passed with the normal user-level Rust installation.
 
-**Planned external tests:** the black-box procedures in this guide. They have not been executed as a complete campaign. Do not mark a case passed merely because a related Rust regression passed. Hosted Linux/Windows CI, performance measurements, dependency advisory scanning, and fuzzing also require their own results.
+**Additional external tests:** the manual procedures in this guide have not been executed as a complete campaign. The automated FastAPI suite has its own saved results; do not infer that every manual case below has passed from that result or a Rust regression. Hosted Linux/Windows CI, performance measurements, dependency advisory scanning, and fuzzing require their own results.
 
 See the [verification report](../docs/m3-observability-review.md) for the earlier run's evidence, fixes, and limitations. See the [README](../README.md) for the current product contract.
 
@@ -29,7 +31,7 @@ See the [verification report](../docs/m3-observability-review.md) for the earlie
 ### Observation semantics
 
 - Timestamp: wall-clock time when the parsed request enters the handler, printed as Unix seconds and nanoseconds.
-- Duration: monotonic elapsed processing time through response buffering. It excludes sending the buffered response to the client.
+- Duration: monotonic time from parsed-request handler entry through the elapsed sample after response buffering/reframing or proxy error construction. It excludes admission/header parsing, observation sanitization/queue/output, and sending the buffered response to the client.
 - `Success`: the upstream exchange completed, including an upstream `4xx` or `5xx`. Inspect the HTTP status separately for application failure.
 - `BackendFailure`: upstream connection, body read, or response constraint failed.
 - `BackendTimeout`: upstream request or response frame read timed out.
@@ -52,7 +54,7 @@ Example output, with illustrative timing and timestamp:
 | Body size | At most 4 MiB for each request and response |
 | Body timeout | 15 seconds waiting for each next frame; no total transaction deadline |
 | Observation queue | CLI capacity of 1,024 records; full or closed channels drop records without waiting |
-| Drop reporting | Failed channel-send count printed at proxy shutdown; not a count of every possible lost transaction |
+| Drop reporting | Enqueued/full/closed counts at shutdown; live snapshots through ObservationStats; written/unconfirmed output totals; not a complete transaction ledger |
 | Shutdown | Proxy connection grace of up to 2 seconds, then output completion wait of up to 2 seconds |
 | Privacy | No body/header fields in records; heuristic query-value redaction; paths and unrecognized query values remain visible |
 | Missing records | Parser-level rejections, cancelled handlers, queue drops, and failed/blocked output can leave no delivered record |
@@ -77,7 +79,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1
 
 If your Python installation uses `python` instead of the launcher, replace `py -3` throughout this guide with `python`.
 
-**Current-machine prerequisite:** when preparing this guide, `py -3` reported `No installed Python found!`. The launcher alone is not a Python runtime. Install a Python 3 interpreter, or replace the commands with the path to an available interpreter, before starting the Python fixtures. This does not block the Rust development checks. The Python snippets were syntax-checked with the bundled workspace interpreter; the external campaign remains unrun.
+**Current-machine prerequisite:** `py -3` previously reported `No installed Python found!`. A project virtual environment is now available for the FastAPI suite at `.venv`; use `.venv/Scripts/python.exe` on Windows for these commands. A fresh checkout still needs a Python 3 interpreter and the dependencies described in the M3 contract. The additional manual campaign remains unrun.
 
 The branch should be `m3-observability`. Record existing changes; do not reset them to perform a test. The check script should finish with `All development checks passed.`
 
@@ -412,7 +414,7 @@ Queue saturation is not guaranteed merely by sending 1,025 requests: the consume
 
 For the terminal-control test, PowerShell can construct a fake name with ``$label = "orders`nline$([char]27)[31m"``; start `attach --name $label` in a separate run and inspect the captured file.
 
-For shutdown timing, measure the proxy grace and output wait separately where possible. They can add up to roughly four seconds plus scheduling/process-exit overhead. A deliberately blocked stderr reader can stall synchronous operational logging, so keep stderr draining when isolating stdout behavior. That stderr limitation is distinct from the bounded stdout drain.
+For shutdown timing, measure connection grace, observation output, and diagnostic output separately where possible. Their deadlines can add up to roughly six seconds plus scheduling/process-exit overhead. Blocked stderr must not stall HTTP processing: diagnostics now use a separate bounded nonblocking queue. Run `python scripts/smoke_http_review.py` to reproduce blocked and closed stderr, verify continued HTTP completion, check measured queue drops after drainage resumes, and assert bounded unsuccessful shutdown when stderr stays blocked. Keep stderr draining when isolating stdout behavior so each loss mechanism can be identified. See the [diagnostics contract](M3_OBSERVABILITY.md#bounded-operational-diagnostics) and [final report](M3_FINAL_ENGINEERING_REPORT.md).
 
 ## 9. Independent checks before merging or releasing
 
