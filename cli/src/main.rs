@@ -1,6 +1,10 @@
 use std::{
     io::{self, Write},
     net::SocketAddr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -9,10 +13,12 @@ use tokio::sync::{mpsc, oneshot};
 
 const OBSERVATION_CAPACITY: usize = 1024;
 const OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const DIAGNOSTIC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn print_observations(
     mut receiver: mpsc::Receiver<core_engine::Observation>,
     mut writer: impl Write,
+    written: &AtomicU64,
 ) -> io::Result<()> {
     while let Some(obs) = receiver.blocking_recv() {
         let query = obs
@@ -36,6 +42,7 @@ fn print_observations(
             timestamp.as_secs(),
             timestamp.subsec_nanos(),
         )?;
+        written.fetch_add(1, Ordering::Relaxed);
     }
     writer.flush()
 }
@@ -67,7 +74,22 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    let result = run().await;
+    if let Err(error) = &result {
+        core_engine::diagnostic!("Error: {error}");
+    }
+    // Returning Result would let Rust's termination handler synchronously write
+    // to stderr. Use ExitCode so even an error with a blocked sink can exit.
+    let diagnostics = core_engine::diagnostics::finish(DIAGNOSTIC_SHUTDOWN_TIMEOUT).await;
+    if result.is_err() || diagnostics.is_err() {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match Args::parse().command {
         Command::Attach {
             listen,
@@ -76,6 +98,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let (tx, rx) = mpsc::channel(OBSERVATION_CAPACITY);
             let (done_tx, done_rx) = oneshot::channel();
+            let stats = core_engine::ObservationStats::default();
+            let written = Arc::new(AtomicU64::new(0));
+            let printer_written = Arc::clone(&written);
             // A dedicated thread keeps blocking stdout writes off Tokio workers.
             // Unlike spawn_blocking, it does not hold runtime shutdown open if
             // an output pipe stops accepting data indefinitely.
@@ -83,21 +108,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .name("exaprop-observations".into())
                 .spawn(move || {
                     let stdout = io::stdout();
-                    let result = print_observations(rx, stdout.lock());
+                    let result = print_observations(rx, stdout.lock(), &printer_written);
                     let _ = done_tx.send(result);
                 })?;
 
-            let result =
-                core_engine::proxy::run_with_observer(listen, target, name, Some(tx)).await;
-            match tokio::time::timeout(OUTPUT_SHUTDOWN_TIMEOUT, done_rx).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => eprintln!("Observation output failed: {error}"),
-                Ok(Err(error)) => eprintln!("Observation output thread failed: {error}"),
-                Err(_) => eprintln!(
-                    "Observation output did not drain within 2 seconds; queued records may be lost"
-                ),
-            }
+            let result = core_engine::proxy::run_with_observer_and_stats(
+                listen,
+                target,
+                name,
+                Some(tx),
+                stats.clone(),
+            )
+            .await;
+            let output_result = match tokio::time::timeout(OUTPUT_SHUTDOWN_TIMEOUT, done_rx).await {
+                Ok(Ok(result)) => result.map_err(|error| {
+                    io::Error::new(error.kind(), format!("Observation output failed: {error}"))
+                }),
+                Ok(Err(error)) => Err(io::Error::other(format!(
+                    "Observation output thread failed: {error}"
+                ))),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Observation output did not drain within 2 seconds; queued records may be lost",
+                )),
+            };
+            let written = written.load(Ordering::Relaxed);
+            core_engine::diagnostic!(
+                "observation_output written={} unconfirmed={} drained={}",
+                written,
+                stats.snapshot().enqueued.saturating_sub(written),
+                output_result.is_ok()
+            );
             result?;
+            output_result?;
         }
     }
 
@@ -140,7 +183,9 @@ mod tests {
         tx.try_send(observation).unwrap();
         drop(tx);
         let mut output = Vec::new();
-        print_observations(rx, &mut output).unwrap();
+        let written = AtomicU64::new(0);
+        print_observations(rx, &mut output, &written).unwrap();
+        assert_eq!(written.load(Ordering::Relaxed), 2);
         let output = String::from_utf8(output).unwrap();
         assert_eq!(output.lines().count(), 2);
         assert!(!output.contains('\u{1b}'));
@@ -175,7 +220,9 @@ mod tests {
         .unwrap();
         drop(tx);
         assert_eq!(
-            print_observations(rx, BrokenWriter).unwrap_err().kind(),
+            print_observations(rx, BrokenWriter, &AtomicU64::new(0))
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::BrokenPipe
         );
     }
