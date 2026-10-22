@@ -33,6 +33,24 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Build release
         run: cargo build --workspace --release --locked
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install FastAPI smoke dependencies
+        run: python -m pip install -r examples/requirements-smoke.txt
+      - name: Run real-backend smoke checks
+        run: python scripts/smoke_fastapi.py --include-timeouts
+      - name: Run HTTP review and blocked-diagnostics regressions
+        run: python scripts/smoke_http_review.py
+      - name: Preserve smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m3-http-smoke-${{ matrix.os }}
+          path: |
+            tmp/fastapi-smoke/
+            tmp/http-review/
+          if-no-files-found: ignore
       - name: Build documentation
         run: cargo doc --workspace --no-deps --locked
         env:
