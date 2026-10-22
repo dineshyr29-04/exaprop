@@ -1,55 +1,30 @@
-# Security Policy
+# Security policy
 
-## Scope
+ExaProp is an early-stage HTTP proxy and observability project. Security concerns include unsafe HTTP handling, unintended network exposure, sensitive output, dependency vulnerabilities, and code execution or privilege escalation.
 
-ExaProp is an early-stage open-source systems and research project.
+## Private reporting
 
-Security reports are especially important for issues involving:
+**Do not report suspected vulnerabilities through public issues, pull requests, discussions, or CI logs.** Do not upload credentials, authorization headers, private URLs, traffic captures, or exploit details publicly.
 
-* arbitrary code execution
-* privilege escalation
-* unintended network exposure
-* sensitive information disclosure
-* unsafe request handling
-* vulnerabilities in the proxy or observation components
-* vulnerabilities introduced through project dependencies
+GitHub private vulnerability reporting is currently disabled for this repository (verified 22 October 2026). No alternate private security contact is published in the repository. This is a reporting-channel gap, not an invitation to disclose publicly. If you already have a verified private channel to a maintainer, use it; otherwise withhold sensitive details until a private route is established.
 
-## Reporting a Vulnerability
+**Maintainer action required:** enable private vulnerability reporting under the repository's security settings, or publish a verified private contact here. No response-time commitment or contact address is implied by this policy.
 
-**Please do not report security vulnerabilities through public GitHub Issues.**
+Once private reporting is enabled, open the repository's **Security → Advisories → Report a vulnerability** flow and submit the report privately. The current [advisories page](https://github.com/dineshyr29-04/exaprop/security/advisories) is not itself proof that private reporting is enabled.
 
-Use GitHub's private vulnerability reporting / Security Advisories mechanism when it is available for the repository.
+A useful private report includes:
 
-When reporting a vulnerability, please include:
+- Affected version or commit, platform, and component.
+- Minimal reproduction using synthetic data and systems you control.
+- Expected and actual behavior, impact, and any known mitigation.
+- Sanitized logs sufficient to reproduce the issue without exposing unrelated data.
 
-* a clear description of the issue
-* affected component or version
-* reproduction steps or proof of concept
-* expected behavior
-* actual behavior
-* potential security impact
-* any known mitigation, if available
+Avoid accessing, modifying, or deleting data belonging to others. Coordinate public disclosure with maintainers after investigation and remediation; no response SLA is currently published.
 
-Please provide enough information for the issue to be reproduced and investigated.
+## Versions and deployment boundaries
 
-## Supported Versions
+No formal supported-version matrix or security-support lifetime is published. Development interfaces and behavior may change. Do not infer a maintenance promise from a version number or roadmap milestone.
 
-ExaProp is currently under active development.
+Current ExaProp traffic is plain HTTP. The proxy provides no built-in authentication or public-edge hardening. Observation filtering is heuristic: visible paths, query-name spelling, and unrecognized query values can contain secrets. Keep both observations and diagnostics access-controlled and review them before sharing. Bounded queues may drop output and are not an audit log.
 
-Until the project establishes a formal release-support policy, security fixes will be handled based on the affected release and the severity of the issue.
-
-Development versions may change without notice.
-
-## Responsible Disclosure
-
-Please allow the maintainers reasonable time to investigate and address a reported vulnerability before publicly disclosing technical details.
-
-Security researchers are encouraged to avoid accessing, modifying, or deleting data that does not belong to them while demonstrating a vulnerability.
-
-## Experimental Features
-
-Some future ExaProp features may involve fault injection, traffic manipulation, or other potentially disruptive experiments.
-
-Such features must only be used against systems that you own or are explicitly authorized to test.
-
-Never use ExaProp's experimental capabilities against production or third-party systems without explicit authorization.
+Use ExaProp only with systems you own or are authorized to test. Future anomaly detection, fault injection, or traffic manipulation proposals do not change these boundaries. See the [README limitations](README.md#http-behavior-and-limitations) and [observation privacy contract](documents/M3_OBSERVABILITY.md#privacy-policy).

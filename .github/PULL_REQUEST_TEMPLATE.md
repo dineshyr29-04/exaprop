@@ -1,32 +1,27 @@
-## 📝 Description
-<!-- Provide a brief description of the changes introduced by this pull request. -->
+## Summary
+<!-- What changed and why? -->
 
-## 🔗 Related Issue(s)
-<!-- If this PR fixes or relates to an open issue, link it here (e.g. Closes #123, Refs #45). -->
-- Closes #
+## Motivation / related issues
+<!-- Describe the problem. Link an existing issue if applicable; otherwise say none. -->
 
-## 🛠️ Type of Change
-<!-- Please check the boxes that apply. -->
-- [ ] 🐛 Bug fix (non-breaking change which fixes an issue)
-- [ ] ✨ New feature (non-breaking change which adds functionality)
-- [ ] 💥 Breaking change (fix or feature that would cause existing functionality to not work as expected)
-- [ ] 📚 Documentation update
-- [ ] ⚡ Performance improvement
-- [ ] 🧹 Refactoring or cleanup
+## Technical changes
+<!-- Key implementation details and design decisions. Use "not applicable" when appropriate. -->
 
-## 🧪 Verification & Testing
-<!-- Describe the testing done to verify the changes. Include commands, screenshots, or sample output. -->
-- [ ] Unit tests pass locally
-- [ ] Manual verification completed
+## Validation
+<!-- List exact commands and results. Explain skipped checks. For documentation-only changes, describe link/content checks; new tests are not mandatory. -->
 
-```bash
-# Testing commands executed
-```
+## Compatibility and risk
+<!-- Behavior, protocol/API changes, regressions, platform impact, and remaining limitations. -->
 
-## ✅ Checklist
-<!-- Before submitting, please check all relevant items. -->
-- [ ] My code adheres to the project's coding conventions and style guidelines.
-- [ ] I have read and followed the [Contributing Guidelines](CONTRIBUTING.md).
-- [ ] I have commented complex or non-obvious sections of code.
-- [ ] I have added or updated relevant documentation (if applicable).
-- [ ] My changes generate no new compiler, linter, or runtime warnings.
+## Documentation
+<!-- List updated documentation, or explain why no update is needed. -->
+
+## Reviewer notes
+<!-- Areas needing attention or decisions. Screenshots are optional and only useful for visual changes. -->
+
+## Checklist
+
+- [ ] The change is focused and follows the contributing guide.
+- [ ] Validation results and any skipped checks are recorded above.
+- [ ] Behavioral changes have appropriate regression coverage; exceptions are explained.
+- [ ] Compatibility, documentation, and privacy implications have been considered.

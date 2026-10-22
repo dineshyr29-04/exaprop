@@ -1,12 +1,17 @@
-name: Rust checks
+name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   verify:
@@ -18,11 +23,29 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      # Dependabot checks immutable action pins weekly (.github/dependabot.yml).
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Rust components
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-          rustup default stable
+          rustc --version --verbose
+          cargo --version
+      - name: Identify compiler for cache
+        id: rust
+        shell: bash
+        run: echo "version=$(rustc --version | cut -d ' ' -f 2-3)" >> "$GITHUB_OUTPUT"
+      - name: Cache Cargo dependencies and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check compilation
@@ -33,9 +56,12 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Build release
         run: cargo build --workspace --release --locked
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
+          cache: pip
+          cache-dependency-path: examples/requirements-smoke.txt
       - name: Install FastAPI smoke dependencies
         run: python -m pip install -r examples/requirements-smoke.txt
       - name: Run real-backend smoke checks
@@ -44,13 +70,14 @@ jobs:
         run: python scripts/smoke_http_review.py
       - name: Preserve smoke evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: m3-http-smoke-${{ matrix.os }}
           path: |
             tmp/fastapi-smoke/
             tmp/http-review/
           if-no-files-found: ignore
+          retention-days: 7
       - name: Build documentation
         run: cargo doc --workspace --no-deps --locked
         env:

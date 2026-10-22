@@ -1,51 +1,80 @@
-name: 🐛 Bug Report
-description: Report a reproducible bug or unexpected error in FaultLab
-labels: ["bug", "triage"]
+name: Bug report
+description: Report reproducible ExaProp behavior
+labels: [bug]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for filing a bug report! Please provide as much detail as possible to help us reproduce and resolve the problem quickly.
+        For suspected vulnerabilities, follow SECURITY.md instead of opening a public issue.
+        Remove credentials, authorization headers, private URLs, sensitive query values,
+        and traffic captures. Prefer a minimal local backend and synthetic data.
   - type: textarea
-    id: description
+    id: summary
     attributes:
-      label: Bug Description
-      description: A clear and concise description of what the bug is.
-      placeholder: Describe the problem clearly...
+      label: Problem summary
+      description: What went wrong and how does it affect your use case?
     validations:
       required: true
   - type: textarea
     id: reproduction
     attributes:
-      label: Steps to Reproduce
-      description: Detailed steps to reproduce the issue.
+      label: Steps to reproduce
+      description: Include a minimal backend/setup and requests using synthetic data.
       placeholder: |
-        1. Run '...'
-        2. Execute scenario '...'
-        3. See error
+        1. Start a local HTTP backend on ...
+        2. Start ExaProp with the sanitized command below
+        3. Send ... and observe ...
     validations:
       required: true
   - type: textarea
     id: expected
     attributes:
-      label: Expected vs Actual Behavior
-      description: What did you expect to happen, and what actually happened?
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include HTTP status and whether the failure is reproducible.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ExaProp version or commit
+      description: Use exaprop --version and, for source builds, git rev-parse HEAD.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      placeholder: Windows 11 x86_64; Ubuntu 24.04 aarch64
+    validations:
+      required: true
+  - type: textarea
+    id: toolchain
+    attributes:
+      label: Rust toolchain (when relevant)
+      description: For source-build or compiler problems, include rustc -vV and cargo --version.
+      render: text
+  - type: textarea
+    id: command
+    attributes:
+      label: Sanitized CLI command
+      description: Replace private addresses, service names, and other sensitive values.
+      render: text
     validations:
       required: true
   - type: textarea
     id: logs
     attributes:
-      label: Error Logs or Output
-      description: Relevant logs or terminal tracebacks (use code blocks).
-      render: shell
+      label: Relevant sanitized logs or observations
+      description: Use a short excerpt. Redaction is heuristic; review paths and query values manually. Do not attach private traffic captures.
+      render: text
   - type: textarea
-    id: environment
+    id: context
     attributes:
-      label: Environment & System Info
-      description: OS version, compiler/runtime, FaultLab version, architecture.
-      placeholder: |
-        - OS: Linux (Fedora 44 / Ubuntu 24.04 / macOS 15)
-        - Architecture: x86_64 / arm64
-        - Version: v0.1.0
-    validations:
-      required: true
+      label: Additional context
+      description: Backend/framework, frequency, workarounds, or related issues.
