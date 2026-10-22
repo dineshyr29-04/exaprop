@@ -16,20 +16,14 @@ vendor/
 *.test
 *.prof
 
-# Rust
-target/
-
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
 .Python
 env/
 venv/
 .venv/
-build/
-dist/
 *.egg-info/
 
 # Node / Web
