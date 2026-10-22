@@ -91,6 +91,8 @@ Validate workflows with [actionlint](https://github.com/rhysd/actionlint) and pa
 
 Actions are pinned to full commit SHAs with release-version comments. [Dependabot](.github/dependabot.yml) proposes GitHub Actions updates weekly. Review upstream release notes and runtime requirements, keep comments aligned with pins, and require CI before merging updates. Hosted `*-latest` runners and stable Rust intentionally move over time; record exact versions in investigations. The compiler version and lockfile participate in the Cargo cache key. Caches are performance aids, not proof of verification.
 
+CI runs on pushes to `main`, on all pull requests (including forks), and on manual dispatch. Feature-branch pushes do not start a second full matrix alongside PR checks. Before opening a PR, run the checks locally or manually dispatch CI for your branch. Every run retains Linux/Windows verification and both M3 smoke suites.
+
 PR CI uses a read-only token, no checkout credentials, no project secrets, and no `pull_request_target` execution. Forked PRs run the same test suites. Keep that boundary when changing automation. Do not add publishing or deployment behavior as part of routine CI maintenance.
 
 ## Submit a useful pull request
