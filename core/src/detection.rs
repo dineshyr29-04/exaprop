@@ -329,3 +329,483 @@ impl Detector {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::Method;
+    use std::time::UNIX_EPOCH;
+
+    fn observation(status: u16, outcome: RequestOutcome, duration: Duration) -> Observation {
+        Observation {
+            timestamp: UNIX_EPOCH + Duration::new(42, 123_456_789),
+            service_name: "orders".into(),
+            method: Method::GET,
+            path: "/items".into(),
+            query: Some("page=2".into()),
+            status: StatusCode::from_u16(status).unwrap(),
+            duration,
+            outcome,
+        }
+    }
+
+    fn assert_evidence(
+        anomaly: Anomaly,
+        source: &Observation,
+        reasons: &[AnomalyKind],
+        severity: Severity,
+        origin: StatusOrigin,
+        threshold: Option<Duration>,
+    ) {
+        assert_eq!(anomaly.timestamp(), source.timestamp);
+        assert_eq!(anomaly.status(), source.status);
+        assert_eq!(anomaly.outcome(), source.outcome);
+        assert_eq!(anomaly.duration(), source.duration);
+        assert_eq!(anomaly.origin(), origin);
+        assert_eq!(anomaly.severity(), severity);
+        assert_eq!(anomaly.duration_threshold(), threshold);
+        assert!(!anomaly.matched_rules().is_empty());
+        assert_eq!(anomaly.matched_rules().len(), reasons.len());
+        assert_eq!(anomaly.matched_rules().iter().collect::<Vec<_>>(), reasons);
+        for kind in [
+            AnomalyKind::HttpServerError,
+            AnomalyKind::ElevatedRequestDuration,
+            AnomalyKind::UpstreamTimeout,
+        ] {
+            assert_eq!(
+                anomaly.matched_rules().contains(kind),
+                reasons.contains(&kind)
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_accepts_boundaries_and_defaults_to_one_second() {
+        assert_eq!(
+            DetectionConfig::default(),
+            DetectionConfig::new(1_000).unwrap()
+        );
+        for threshold_ms in [1, 750, 1_000, 3_600_000] {
+            let config = DetectionConfig::new(threshold_ms).unwrap();
+            assert_eq!(
+                config.latency_threshold(),
+                Duration::from_millis(threshold_ms)
+            );
+            assert_eq!(Detector::new(config).config(), config);
+        }
+    }
+
+    #[test]
+    fn invalid_thresholds_return_typed_errors_without_clamping() {
+        for threshold_ms in [0, 3_600_001, u64::MAX] {
+            let error = DetectionConfig::new(threshold_ms).unwrap_err();
+            assert_eq!(error.threshold_ms(), threshold_ms);
+            assert_eq!(
+                error.to_string(),
+                format!("duration threshold must be 1..=3600000 ms; received {threshold_ms} ms")
+            );
+            let standard_error: &dyn std::error::Error = &error;
+            assert!(standard_error.source().is_none());
+        }
+    }
+
+    #[test]
+    fn short_normal_and_client_error_responses_do_not_match() {
+        let detector = Detector::new(DetectionConfig::default());
+        for (status, outcome) in [
+            (200, RequestOutcome::Success),
+            (404, RequestOutcome::Success),
+            (408, RequestOutcome::ClientTimeout),
+            (400, RequestOutcome::ClientFailure),
+            (413, RequestOutcome::Rejected),
+            // A failure outcome alone is not one of the three predicates.
+            (200, RequestOutcome::BackendFailure),
+        ] {
+            assert_eq!(
+                detector.evaluate(&observation(status, outcome, Duration::from_millis(10))),
+                None,
+                "status={status}, outcome={outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_server_error_uses_only_the_inclusive_5xx_range() {
+        let detector = Detector::new(DetectionConfig::default());
+        for status in 500..=599 {
+            let source = observation(status, RequestOutcome::Success, Duration::ZERO);
+            assert_evidence(
+                detector.evaluate(&source).unwrap(),
+                &source,
+                &[AnomalyKind::HttpServerError],
+                Severity::Error,
+                StatusOrigin::BackendResponse,
+                None,
+            );
+        }
+        for status in [100, 199, 200, 404, 499, 600, 999] {
+            assert_eq!(
+                detector.evaluate(&observation(
+                    status,
+                    RequestOutcome::Success,
+                    Duration::ZERO
+                )),
+                None,
+                "status {status} is outside 500..=599"
+            );
+        }
+    }
+
+    #[test]
+    fn duration_comparison_is_strict_to_the_nanosecond_for_custom_thresholds() {
+        for threshold_ms in [1, 750, 1_000, 3_600_000] {
+            let config = DetectionConfig::new(threshold_ms).unwrap();
+            let threshold = config.latency_threshold();
+            let detector = Detector::new(config);
+            for duration in [
+                Duration::ZERO,
+                threshold - Duration::from_nanos(1),
+                threshold,
+            ] {
+                assert_eq!(
+                    detector.evaluate(&observation(200, RequestOutcome::Success, duration)),
+                    None
+                );
+            }
+            let source = observation(
+                200,
+                RequestOutcome::Success,
+                threshold + Duration::from_nanos(1),
+            );
+            assert_evidence(
+                detector.evaluate(&source).unwrap(),
+                &source,
+                &[AnomalyKind::ElevatedRequestDuration],
+                Severity::Warning,
+                StatusOrigin::BackendResponse,
+                Some(threshold),
+            );
+        }
+    }
+
+    #[test]
+    fn all_rule_combinations_form_one_canonical_reason_set() {
+        use AnomalyKind::{
+            ElevatedRequestDuration as D, HttpServerError as S, UpstreamTimeout as U,
+        };
+        use RequestOutcome::{BackendTimeout, Success};
+        let detector = Detector::new(DetectionConfig::default());
+        let threshold = Duration::from_secs(1);
+        struct Case {
+            status: u16,
+            outcome: RequestOutcome,
+            millis: u64,
+            reasons: &'static [AnomalyKind],
+            severity: Severity,
+            origin: StatusOrigin,
+        }
+        let cases = [
+            Case {
+                status: 200,
+                outcome: Success,
+                millis: 10,
+                reasons: &[],
+                severity: Severity::Warning,
+                origin: StatusOrigin::BackendResponse,
+            },
+            Case {
+                status: 503,
+                outcome: Success,
+                millis: 10,
+                reasons: &[S],
+                severity: Severity::Error,
+                origin: StatusOrigin::BackendResponse,
+            },
+            Case {
+                status: 200,
+                outcome: Success,
+                millis: 1_001,
+                reasons: &[D],
+                severity: Severity::Warning,
+                origin: StatusOrigin::BackendResponse,
+            },
+            Case {
+                status: 200,
+                outcome: BackendTimeout,
+                millis: 10,
+                reasons: &[U],
+                severity: Severity::Error,
+                origin: StatusOrigin::ProxyResponse,
+            },
+            Case {
+                status: 503,
+                outcome: Success,
+                millis: 1_001,
+                reasons: &[S, D],
+                severity: Severity::Error,
+                origin: StatusOrigin::BackendResponse,
+            },
+            Case {
+                status: 503,
+                outcome: BackendTimeout,
+                millis: 10,
+                reasons: &[S, U],
+                severity: Severity::Error,
+                origin: StatusOrigin::ProxyResponse,
+            },
+            Case {
+                status: 200,
+                outcome: BackendTimeout,
+                millis: 1_001,
+                reasons: &[D, U],
+                severity: Severity::Error,
+                origin: StatusOrigin::ProxyResponse,
+            },
+            Case {
+                status: 504,
+                outcome: BackendTimeout,
+                millis: 15_000,
+                reasons: &[S, D, U],
+                severity: Severity::Error,
+                origin: StatusOrigin::ProxyResponse,
+            },
+        ];
+        for Case {
+            status,
+            outcome,
+            millis,
+            reasons,
+            severity,
+            origin,
+        } in cases
+        {
+            let source = observation(status, outcome, Duration::from_millis(millis));
+            let result = detector.evaluate(&source);
+            if reasons.is_empty() {
+                assert_eq!(result, None);
+            } else {
+                assert_evidence(
+                    result.unwrap(),
+                    &source,
+                    reasons,
+                    severity,
+                    origin,
+                    reasons.contains(&D).then_some(threshold),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backend_error_status_does_not_infer_a_timeout() {
+        let detector = Detector::new(DetectionConfig::default());
+        for status in [502, 504] {
+            for (outcome, origin) in [
+                (RequestOutcome::Success, StatusOrigin::BackendResponse),
+                (RequestOutcome::BackendFailure, StatusOrigin::ProxyResponse),
+            ] {
+                let source = observation(status, outcome, Duration::from_millis(10));
+                assert_evidence(
+                    detector.evaluate(&source).unwrap(),
+                    &source,
+                    &[AnomalyKind::HttpServerError],
+                    Severity::Error,
+                    origin,
+                    None,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_timeout_matches_its_outcome_even_without_a_5xx_status() {
+        let detector = Detector::new(DetectionConfig::default());
+        for status in [200, 404, 408] {
+            let source = observation(status, RequestOutcome::BackendTimeout, Duration::ZERO);
+            assert_evidence(
+                detector.evaluate(&source).unwrap(),
+                &source,
+                &[AnomalyKind::UpstreamTimeout],
+                Severity::Error,
+                StatusOrigin::ProxyResponse,
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn long_client_timeout_only_matches_elevated_duration() {
+        let detector = Detector::new(DetectionConfig::default());
+        let source = observation(408, RequestOutcome::ClientTimeout, Duration::from_secs(15));
+        assert_evidence(
+            detector.evaluate(&source).unwrap(),
+            &source,
+            &[AnomalyKind::ElevatedRequestDuration],
+            Severity::Warning,
+            StatusOrigin::ProxyResponse,
+            Some(Duration::from_secs(1)),
+        );
+    }
+
+    #[test]
+    fn provenance_preserves_every_outcome_including_synthetic_combinations() {
+        let detector = Detector::new(DetectionConfig::default());
+        for (outcome, origin) in [
+            (RequestOutcome::Success, StatusOrigin::BackendResponse),
+            (RequestOutcome::BackendFailure, StatusOrigin::ProxyResponse),
+            (RequestOutcome::BackendTimeout, StatusOrigin::ProxyResponse),
+            (RequestOutcome::ClientFailure, StatusOrigin::ProxyResponse),
+            (RequestOutcome::ClientTimeout, StatusOrigin::ProxyResponse),
+            (RequestOutcome::Rejected, StatusOrigin::ProxyResponse),
+        ] {
+            let source = observation(501, outcome, Duration::ZERO);
+            let reasons: &[AnomalyKind] = if outcome == RequestOutcome::BackendTimeout {
+                &[AnomalyKind::HttpServerError, AnomalyKind::UpstreamTimeout]
+            } else {
+                &[AnomalyKind::HttpServerError]
+            };
+            assert_evidence(
+                detector.evaluate(&source).unwrap(),
+                &source,
+                reasons,
+                Severity::Error,
+                origin,
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn extreme_duration_and_pre_epoch_timestamp_are_copied_without_conversion() {
+        let detector = Detector::new(DetectionConfig::default());
+        let mut source = observation(503, RequestOutcome::Success, Duration::MAX);
+        source.timestamp = UNIX_EPOCH - Duration::from_nanos(1);
+        assert_evidence(
+            detector.evaluate(&source).unwrap(),
+            &source,
+            &[
+                AnomalyKind::HttpServerError,
+                AnomalyKind::ElevatedRequestDuration,
+            ],
+            Severity::Error,
+            StatusOrigin::BackendResponse,
+            Some(Duration::from_secs(1)),
+        );
+    }
+
+    #[test]
+    fn repeated_evaluation_has_no_history_or_observation_mutation() {
+        let detector = Detector::new(DetectionConfig::new(750).unwrap());
+        let source = observation(503, RequestOutcome::Success, Duration::from_millis(800));
+        let original = source.clone();
+        let expected = detector.evaluate(&source).unwrap();
+        for _ in 0..32 {
+            assert_eq!(detector.evaluate(&source), Some(expected));
+            assert_eq!(source, original);
+        }
+        assert_eq!(
+            detector.config().latency_threshold(),
+            Duration::from_millis(750)
+        );
+    }
+
+    #[test]
+    fn event_is_independent_of_sensitive_metadata_and_outlives_its_source() {
+        let detector = Detector::new(DetectionConfig::default());
+        let baseline = observation(503, RequestOutcome::Success, Duration::from_secs(2));
+        let expected = detector.evaluate(&baseline).unwrap();
+        let event = {
+            let mut source = baseline.clone();
+            source.service_name = "SERVICE_SECRET\n\u{1b}[31m".repeat(1_024);
+            source.method = Method::from_bytes(b"PRIVATE_METHOD_SENTINEL").unwrap();
+            source.path = "/PATH_SECRET/BODY_SECRET/HEADER_SECRET".repeat(1_024);
+            // External producers can populate unfiltered fields. The model must
+            // ignore them rather than assume that the M3 constructor ran.
+            source.query = Some("token=QUERY_SECRET&%2574oken=NESTED_SECRET".repeat(1_024));
+            detector.evaluate(&source).unwrap()
+        };
+        assert_eq!(event, expected);
+        let debug = format!("{event:?}");
+        for sentinel in [
+            "SERVICE_SECRET",
+            "PRIVATE_METHOD_SENTINEL",
+            "PATH_SECRET",
+            "BODY_SECRET",
+            "HEADER_SECRET",
+            "QUERY_SECRET",
+            "NESTED_SECRET",
+        ] {
+            assert!(!debug.contains(sentinel));
+        }
+
+        // Exhaustive destructuring makes future event fields require an
+        // intentional update to this privacy/evidence test.
+        let Anomaly {
+            timestamp,
+            status,
+            outcome,
+            duration,
+            origin,
+            matched_rules,
+            severity,
+            duration_threshold,
+        } = event;
+        assert_eq!(timestamp, baseline.timestamp);
+        assert_eq!(status, baseline.status);
+        assert_eq!(outcome, baseline.outcome);
+        assert_eq!(duration, baseline.duration);
+        assert_eq!(origin, StatusOrigin::BackendResponse);
+        assert_eq!(
+            matched_rules.iter().collect::<Vec<_>>(),
+            vec![
+                AnomalyKind::HttpServerError,
+                AnomalyKind::ElevatedRequestDuration,
+            ]
+        );
+        assert_eq!(severity, Severity::Error);
+        assert_eq!(duration_threshold, Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn model_types_are_copy_send_sync_and_severity_has_the_specified_order() {
+        fn assert_value_type<T: Copy + Send + Sync>() {}
+        assert_value_type::<DetectionConfig>();
+        assert_value_type::<DetectionConfigError>();
+        assert_value_type::<Detector>();
+        assert_value_type::<Anomaly>();
+        assert_value_type::<AnomalyKind>();
+        assert_value_type::<MatchedRules>();
+        assert_value_type::<Severity>();
+        assert_value_type::<StatusOrigin>();
+        assert!(Severity::Error > Severity::Warning);
+        assert!(!std::mem::needs_drop::<Anomaly>());
+    }
+
+    #[test]
+    fn shared_detector_evaluates_concurrently_without_mutable_state() {
+        let detector = Detector::new(DetectionConfig::default());
+        let sources = [
+            observation(200, RequestOutcome::Success, Duration::ZERO),
+            observation(500, RequestOutcome::Success, Duration::ZERO),
+            observation(504, RequestOutcome::BackendTimeout, Duration::from_secs(15)),
+            observation(408, RequestOutcome::ClientTimeout, Duration::from_secs(15)),
+        ];
+        let expected = sources.each_ref().map(|source| detector.evaluate(source));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        for _ in 0..64 {
+                            for (source, result) in sources.iter().zip(expected) {
+                                assert_eq!(detector.evaluate(source), result);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    }
+}
