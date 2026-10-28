@@ -1,8 +1,10 @@
 # M4 — Deterministic HTTP anomaly detection
 
-Status: **design proposal for independent engineering review; not implemented**.
+Status: **M4.1 pure detection model implemented; M4.2–M4.5 remain unimplemented and are not authorized by this document**.
 
-Design date: 23 October 2026 (Asia/Calcutta). Source baseline: `origin/main` at `6c862edb86e88abd9ef1d6ede80d14a6821743d8`. Design branch: `m4-anomaly-detection`. Both the M3 merge and repository-standards merge are ancestors of this baseline. The starting tree was clean. This change adds only this document; it does not add detector code, flags, dependencies, or new runtime behavior.
+Design date: 23 October 2026 (Asia/Calcutta). Source baseline: `origin/main` at `6c862edb86e88abd9ef1d6ede80d14a6821743d8`. Design branch: `m4-anomaly-detection`. Both the M3 merge and repository-standards merge are ancestors of this baseline. The original design-only change added this document without runtime code. M4.1 was subsequently authorized separately and implemented in `core/src/detection.rs`, with its module export in `core/src/lib.rs`, through commit `8cb673a584431f79527e80ca089c2ad048c2b1e0`.
+
+Implementation-status review: 28 October 2026. M4.1 includes immutable validated configuration, pure rule evaluation, scalar-only anomaly evidence, and deterministic model tests. It adds no HTTP integration, workers, queues, counters, CLI flags, or anomaly output. Those parts of the design below remain proposals for later phases. Verification results must identify their exact commit and environment; implementation status alone is not a security or merge-readiness guarantee.
 
 ## 1. Executive summary
 
@@ -118,7 +120,7 @@ An identical observation evaluated twice yields the same classification twice. T
 
 ### 7.2 Proposed public core API
 
-Add a small `core_engine::detection` module in `core/src/detection.rs`, exported through [lib.rs](../core/src/lib.rs). These are proposed signatures and invariants, **not implemented Rust code**:
+M4.1 implements the small `core_engine::detection` module in [detection.rs](../core/src/detection.rs), exported through [lib.rs](../core/src/lib.rs). The following contracts describe that pure model; pipeline and presentation behavior elsewhere in this document remains unimplemented:
 
 | Type / operation | Proposed contract |
 | --- | --- |
@@ -317,7 +319,7 @@ Total intended shutdown budget remains approximately two seconds connection grac
 
 ## 15. Testing strategy
 
-The table specifies **future implementation tests**, not tests executed by this design change. Assert typed `Anomaly` fields and exact settled counters, not just an `ANOMALY` substring. Use synthetic durations/SystemTime values for rule tests, barriers/channels for races, injected short lifecycle deadlines for unit tests, and no long unit-test sleeps.
+The table spans all M4 phases. M4.1 implements the pure-model portions in `detection.rs`; CLI, queue, output, counter, and lifecycle scenarios remain planned. Do not infer that all cases below were executed from the model's implementation status. Assert typed `Anomaly` fields and exact settled counters where applicable, not just an `ANOMALY` substring. Use synthetic durations/SystemTime values for rule tests, barriers/channels for races, injected short lifecycle deadlines for unit tests, and no long unit-test sleeps.
 
 Abbreviations: S = HTTP server error; D = elevated request duration; U = upstream timeout. Unless noted, threshold is 1,000 ms and duration 10 ms. For an isolated accepted/written anomalous record, expect `evaluated=1, anomalous=1, normal=0, events_queued=1, events_written=1`; only its matched per-rule counters increment. For a normal one, expect `evaluated=1, normal=1, anomalous=0` and all event counters zero.
 
@@ -364,7 +366,7 @@ Future integration evidence should include typed event fixtures/parsed fields, a
 
 ## 16. Implementation phases
 
-Every phase requires separate implementation authorization after independent design review. No phase is executed by this document.
+Every phase requires separate implementation authorization. M4.1 was authorized and implemented separately from this original design document. M4.2 and subsequent phases have not started; their descriptions below are implementation plans, not existing functionality.
 
 | Phase | Expected files | Responsibilities | Tests / acceptance | Dependencies |
 | --- | --- | --- | --- | --- |
@@ -410,4 +412,4 @@ Expected runtime additions are one pure core module and one small CLI reporting 
 
 M4 does not include machine learning, adaptive statistical baselines, anomaly prediction, root-cause analysis, cross-service tracing, distributed correlation, fault injection, circuit breakers, automatic retries, anomaly-based request blocking, dashboards, persistent storage, cloud infrastructure, or OpenTelemetry exporters. It does not add HTTPS, streaming transport, new HTTP behavior, arbitrary output sinks, or a remote management service.
 
-Future proposals can revisit these topics with evidence and their own scope. This design ends at explainable, best-effort classification of existing HTTP observations. **Stop here for independent review; no detector runtime implementation is authorized by this document.**
+Future proposals can revisit these topics with evidence and their own scope. M4.1 implements only the pure classifier over supplied observations. **Stop after M4.1 verification; do not begin M4.2 or later phases without separate approval.**
