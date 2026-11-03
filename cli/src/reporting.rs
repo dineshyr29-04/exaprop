@@ -100,12 +100,21 @@ impl DetectionStats {
     }
 
     /// Atomically increment a counter, setting the saturation flag if overflowing `u64::MAX`.
+    ///
+    /// Uses race-safe compare-and-swap loop to prevent arithmetic wrapping under concurrent increments.
     #[inline]
     pub fn inc(&self, counter: &AtomicU64) {
-        let prev = counter.fetch_add(1, Ordering::Relaxed);
-        if prev == u64::MAX {
-            counter.store(u64::MAX, Ordering::Relaxed);
-            self.counters_saturated.store(true, Ordering::Relaxed);
+        let mut cur = counter.load(Ordering::Relaxed);
+        loop {
+            if cur == u64::MAX {
+                self.counters_saturated.store(true, Ordering::Relaxed);
+                break;
+            }
+            match counter.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
         }
     }
 
@@ -366,17 +375,18 @@ pub fn render_normal_line(seq: u64, obs: &Observation) -> (Box<[u8]>, bool) {
     let duration_ms = format_duration_ms(obs.duration);
     let outcome = outcome_token(obs.outcome);
 
-    let mut line = format!(
+    let line = format!(
         "OBSERVATION_V1 seq={seq} timestamp={ts} service=\"{service}\" method=\"{method}\" path=\"{path}\" {query} status={} outcome={outcome} duration_ms={duration_ms} truncated_fields={trunc_str}\n",
         obs.status.as_u16()
     );
 
-    let mut is_truncated = !trunc_fields.is_empty();
-    if line.len() > NORMAL_LINE_CAP {
-        is_truncated = true;
-        line.truncate(NORMAL_LINE_CAP - 1);
-        line.push('\n');
-    }
+    let is_truncated = !trunc_fields.is_empty();
+    debug_assert!(
+        line.len() <= NORMAL_LINE_CAP,
+        "normal line length {} exceeds NORMAL_LINE_CAP {}",
+        line.len(),
+        NORMAL_LINE_CAP
+    );
 
     (line.into_bytes().into_boxed_slice(), is_truncated)
 }
@@ -420,33 +430,81 @@ pub fn render_anomaly_line(
     let origin = origin_token(anomaly.origin());
     let severity = severity_token(anomaly.severity());
 
-    let mut line = format!(
+    let line = format!(
         "ANOMALY_V1 seq={seq} timestamp={ts} service=\"{service}\" method=\"{method_str}\" status={} outcome={outcome} origin={origin} severity={severity} duration_ms={duration_ms} reasons={reasons_str} {threshold_str} truncated_fields={trunc_str}\n",
         anomaly.status().as_u16()
     );
 
-    let mut is_truncated = !trunc_fields.is_empty();
-    if line.len() > ANOMALY_LINE_CAP {
-        is_truncated = true;
-        line.truncate(ANOMALY_LINE_CAP - 1);
-        line.push('\n');
-    }
+    let is_truncated = !trunc_fields.is_empty();
+    debug_assert!(
+        line.len() <= ANOMALY_LINE_CAP,
+        "anomaly line length {} exceeds ANOMALY_LINE_CAP {}",
+        line.len(),
+        ANOMALY_LINE_CAP
+    );
 
     (line.into_bytes().into_boxed_slice(), is_truncated)
 }
 
+/// Terminal coordinator error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinatorError {
+    /// Sequence counter reached `u64::MAX`; telemetry terminated to prevent identifier reuse.
+    SequenceOverflow,
+}
+
+impl std::fmt::Display for CoordinatorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SequenceOverflow => write!(f, "sequence overflow"),
+        }
+    }
+}
+
+impl std::error::Error for CoordinatorError {}
+
 /// Dedicated coordinator worker consuming observations, classifying anomalies,
 /// and dispatching pre-rendered batches to the output queue non-blockingly.
 pub fn run_coordinator(
+    observation_rx: mpsc::Receiver<Observation>,
+    output_tx: mpsc::Sender<OutputBatch>,
+    detector: Detector,
+    stats: Arc<DetectionStats>,
+    done_tx: Option<oneshot::Sender<Result<(), CoordinatorError>>>,
+) {
+    run_coordinator_with_initial_seq(observation_rx, output_tx, detector, stats, done_tx, 1);
+}
+
+/// Dedicated coordinator worker with injectable initial sequence for testing boundary behavior.
+pub fn run_coordinator_with_initial_seq(
     mut observation_rx: mpsc::Receiver<Observation>,
     output_tx: mpsc::Sender<OutputBatch>,
     detector: Detector,
     stats: Arc<DetectionStats>,
-    done_tx: Option<oneshot::Sender<()>>,
+    done_tx: Option<oneshot::Sender<Result<(), CoordinatorError>>>,
+    initial_seq: u64,
 ) {
-    let mut seq: u64 = 1;
+    let mut next_seq: Option<u64> = Some(initial_seq);
+    let mut terminal_error: Option<CoordinatorError> = None;
 
     while let Some(obs) = observation_rx.blocking_recv() {
+        let current_seq = match next_seq {
+            Some(s) => s,
+            None => {
+                // Sequence counter reached capacity. Terminate telemetry processing
+                // immediately to prevent identifier reuse.
+                stats.counters_saturated.store(true, Ordering::Relaxed);
+                terminal_error = Some(CoordinatorError::SequenceOverflow);
+                break;
+            }
+        };
+
+        // Advance sequence. If current_seq was u64::MAX, checked_add returns None.
+        next_seq = current_seq.checked_add(1);
+        if next_seq.is_none() {
+            stats.counters_saturated.store(true, Ordering::Relaxed);
+        }
+
         stats.inc(&stats.evaluated);
 
         let maybe_anomaly = detector.evaluate(&obs);
@@ -466,13 +524,6 @@ pub fn run_coordinator(
             stats.inc(&stats.normal);
             false
         };
-
-        let current_seq = seq;
-        if seq == u64::MAX {
-            stats.counters_saturated.store(true, Ordering::Relaxed);
-        } else {
-            seq += 1;
-        }
 
         let (normal_line, normal_trunc) = render_normal_line(current_seq, &obs);
         if normal_trunc {
@@ -519,7 +570,11 @@ pub fn run_coordinator(
     drop(output_tx);
 
     if let Some(tx) = done_tx {
-        let _ = tx.send(());
+        let res = match terminal_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        };
+        let _ = tx.send(res);
     }
 }
 
@@ -577,7 +632,7 @@ pub fn run_writer(
 pub struct TelemetryPipeline {
     observation_tx: mpsc::Sender<Observation>,
     stats: Arc<DetectionStats>,
-    coordinator_done_rx: oneshot::Receiver<()>,
+    coordinator_done_rx: oneshot::Receiver<Result<(), CoordinatorError>>,
     writer_done_rx: oneshot::Receiver<io::Result<()>>,
 }
 
@@ -592,24 +647,53 @@ impl TelemetryPipeline {
     where
         W: Write + Send + 'static,
     {
+        Self::spawn_with_initial_seq(observation_capacity, detector, writer, stats, 1)
+    }
+
+    /// Spawn dedicated coordinator and writer threads with injectable initial sequence for testing.
+    pub fn spawn_with_initial_seq<W>(
+        observation_capacity: usize,
+        detector: Detector,
+        writer: W,
+        stats: Arc<DetectionStats>,
+        initial_seq: u64,
+    ) -> io::Result<(Self, mpsc::Sender<Observation>)>
+    where
+        W: Write + Send + 'static,
+    {
         let (obs_tx, obs_rx) = mpsc::channel(observation_capacity);
         let (out_tx, out_rx) = mpsc::channel(OUTPUT_BATCH_CAPACITY);
         let (coord_done_tx, coord_done_rx) = oneshot::channel();
         let (writer_done_tx, writer_done_rx) = oneshot::channel();
 
         let coord_stats = Arc::clone(&stats);
-        std::thread::Builder::new()
+        let coord_handle = std::thread::Builder::new()
             .name("exaprop-coordinator".into())
             .spawn(move || {
-                run_coordinator(obs_rx, out_tx, detector, coord_stats, Some(coord_done_tx));
+                run_coordinator_with_initial_seq(
+                    obs_rx,
+                    out_tx,
+                    detector,
+                    coord_stats,
+                    Some(coord_done_tx),
+                    initial_seq,
+                );
             })?;
 
         let writer_stats = Arc::clone(&stats);
-        std::thread::Builder::new()
+        let _writer_handle = match std::thread::Builder::new()
             .name("exaprop-writer".into())
             .spawn(move || {
                 let _ = run_writer(out_rx, writer, writer_stats, Some(writer_done_tx));
-            })?;
+            }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Writer thread spawn failed: clean up coordinator so no worker is leaked.
+                drop(obs_tx);
+                let _ = coord_handle.join();
+                return Err(e);
+            }
+        };
 
         let pipeline = Self {
             observation_tx: obs_tx.clone(),
@@ -632,18 +716,26 @@ impl TelemetryPipeline {
         drop(self.observation_tx);
 
         // 1. Await coordinator drain within the shared deadline
-        let coord_res = tokio::time::timeout_at(deadline, self.coordinator_done_rx).await;
-        if coord_res.is_err() {
-            return Err(io::Error::new(
+        let coord_res = match tokio::time::timeout_at(deadline, self.coordinator_done_rx).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(err))) => Err(io::Error::other(format!(
+                "Telemetry coordinator failed: {err}"
+            ))),
+            Ok(Err(_)) => Err(io::Error::other(
+                "Telemetry coordinator terminated prematurely without acknowledging completion",
+            )),
+            Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "Telemetry coordinator did not finish within shutdown timeout",
-            ));
-        }
+            )),
+        };
 
         // 2. Await writer drain and flush within the remaining shared deadline
         let writer_res = match tokio::time::timeout_at(deadline, self.writer_done_rx).await {
             Ok(Ok(res)) => res,
-            Ok(Err(_)) => Err(io::Error::other("Telemetry writer thread panicked")),
+            Ok(Err(_)) => Err(io::Error::other(
+                "Telemetry writer thread panicked or closed without acknowledgment",
+            )),
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "Telemetry writer did not finish within shutdown timeout",
@@ -651,7 +743,10 @@ impl TelemetryPipeline {
         };
 
         let snapshot = self.stats.snapshot();
-        writer_res.map(|()| snapshot)
+        // Propagate coordinator error first if failed, otherwise writer error, otherwise snapshot
+        coord_res?;
+        writer_res?;
+        Ok(snapshot)
     }
 }
 
@@ -1212,5 +1307,351 @@ mod tests {
         assert_eq!(final_snap.evaluated, 50);
         assert_eq!(final_snap.observations_written, 50);
         assert!(final_snap.check_settled_invariants().is_ok());
+    }
+
+    #[test]
+    fn stats_saturating_atomic_inc_at_max_and_max_minus_one_with_concurrency() {
+        let stats = DetectionStats::new_shared();
+        let counter = Arc::new(AtomicU64::new(u64::MAX - 1));
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let s = Arc::clone(&stats);
+            let c = Arc::clone(&counter);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    s.inc(&c);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Must saturate at u64::MAX, NEVER wrap around to 0 or low values
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert!(stats.counters_saturated.load(Ordering::Relaxed));
+
+        // Incrementing again when already at u64::MAX
+        stats.inc(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn coordinator_terminates_on_sequence_overflow_without_identifier_reuse() {
+        let (obs_tx, obs_rx) = mpsc::channel(10);
+        let (out_tx, mut out_rx) = mpsc::channel(10);
+        let config = DetectionConfig::new(500).unwrap();
+        let detector = Detector::new(config);
+        let stats = DetectionStats::new_shared();
+        let (done_tx, mut done_rx) = oneshot::channel();
+
+        // Start coordinator with initial_seq = u64::MAX
+        let coordinator_thread = std::thread::spawn(move || {
+            run_coordinator_with_initial_seq(
+                obs_rx,
+                out_tx,
+                detector,
+                stats,
+                Some(done_tx),
+                u64::MAX,
+            );
+        });
+
+        // 1st request gets seq = u64::MAX
+        obs_tx
+            .try_send(Observation::new(
+                UNIX_EPOCH,
+                "svc".into(),
+                Method::GET,
+                "/first",
+                StatusCode::OK,
+                Duration::from_millis(10),
+                RequestOutcome::Success,
+            ))
+            .unwrap();
+
+        // 2nd request triggers sequence overflow
+        obs_tx
+            .try_send(Observation::new(
+                UNIX_EPOCH,
+                "svc".into(),
+                Method::GET,
+                "/second",
+                StatusCode::OK,
+                Duration::from_millis(10),
+                RequestOutcome::Success,
+            ))
+            .unwrap();
+
+        coordinator_thread.join().unwrap();
+
+        // The coordinator must have terminated with explicit SequenceOverflow error
+        let err = done_rx.try_recv().unwrap().unwrap_err();
+        assert_eq!(err, CoordinatorError::SequenceOverflow);
+
+        // Exactly one batch emitted (seq = u64::MAX). No identifier reuse!
+        let batch1 = out_rx.try_recv().unwrap();
+        let line1 = std::str::from_utf8(&batch1.normal_line).unwrap();
+        assert!(line1.starts_with(&format!("OBSERVATION_V1 seq={} ", u64::MAX)));
+
+        // Output channel was dropped, no second batch
+        assert!(out_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn extreme_durations_timestamps_and_malicious_terminals_preserve_caps_and_utf8() {
+        // Pathological display inputs: ANSI controls, quotes, backslashes, multi-byte emojis
+        let malicious_service = "\x1b[31;1m\"orders\"\n\r\t\\service\x00\x1b[0m".repeat(100);
+        let malicious_path = "/api/v1/🦀/users/\x1b[2J/secret\"\\'\n\0".repeat(500);
+        let malicious_query =
+            "token=\"super\\secret\"&user=\x1b[32madmin\x1b[0m&data=🦀".repeat(200);
+
+        // Extreme timestamps and durations
+        let pre_epoch_timestamp = UNIX_EPOCH - Duration::from_secs(1_500_000_000);
+        let extreme_duration = Duration::MAX;
+
+        let mut obs = Observation::new(
+            pre_epoch_timestamp,
+            malicious_service,
+            Method::POST,
+            &malicious_path,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            extreme_duration,
+            RequestOutcome::Success,
+        );
+        obs.query = Some(malicious_query);
+
+        let config = DetectionConfig::new(500).unwrap();
+        let detector = Detector::new(config);
+        let anomaly = detector.evaluate(&obs).unwrap();
+
+        let (normal_line, normal_trunc) = render_normal_line(42, &obs);
+        assert!(normal_trunc);
+        assert!(normal_line.len() <= NORMAL_LINE_CAP);
+        assert!(normal_line.ends_with(b"\n"));
+
+        // Must be 100% valid UTF-8
+        let normal_str = std::str::from_utf8(&normal_line).unwrap();
+        assert!(normal_str.starts_with("OBSERVATION_V1 seq=42 "));
+        // ANSI escape \x1b must be safely escaped, not raw
+        assert!(!normal_str.contains('\x1b'));
+        assert!(normal_str.contains("\\x1b"));
+        assert!(normal_str.contains("truncated_fields="));
+
+        let (anomaly_line, anomaly_trunc) =
+            render_anomaly_line(42, &obs.service_name, &obs.method, &anomaly);
+        assert!(anomaly_trunc); // Service name exceeded budget
+        assert!(anomaly_line.len() <= ANOMALY_LINE_CAP);
+        assert!(anomaly_line.ends_with(b"\n"));
+
+        let anomaly_str = std::str::from_utf8(&anomaly_line).unwrap();
+        assert!(anomaly_str.starts_with("ANOMALY_V1 seq=42 "));
+        assert!(!anomaly_str.contains('\x1b'));
+        assert!(anomaly_str.contains("\\x1b"));
+        // Required evidence is preserved intact
+        assert!(anomaly_str.contains("reasons=http_server_error,elevated_request_duration"));
+        assert!(anomaly_str.contains("threshold_ms=500"));
+        assert!(anomaly_str.contains("status=500"));
+        // Path and query strictly excluded
+        assert!(!anomaly_str.contains("super\\secret"));
+        assert!(!anomaly_str.contains("/api/v1"));
+    }
+
+    #[test]
+    fn writer_handles_write_zero_and_flush_failure() {
+        struct WriteZeroWriter;
+        impl Write for WriteZeroWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Ok(0) // write-zero simulation
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (out_tx, out_rx) = mpsc::channel(10);
+        let stats = DetectionStats::new_shared();
+
+        let batch = OutputBatch::new(b"line\n".to_vec().into_boxed_slice(), None);
+        out_tx.try_send(batch).unwrap();
+        drop(out_tx);
+
+        let res = run_writer(out_rx, WriteZeroWriter, Arc::clone(&stats), None);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::WriteZero);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.observations_written, 0);
+        assert_eq!(snap.write_errors, 1);
+
+        // Test flush failure
+        struct FlushErrorWriter;
+        impl Write for FlushErrorWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from(io::ErrorKind::ConnectionReset))
+            }
+        }
+
+        let (out_tx, out_rx) = mpsc::channel(10);
+        let stats = DetectionStats::new_shared();
+        out_tx
+            .try_send(OutputBatch::new(
+                b"flush_line\n".to_vec().into_boxed_slice(),
+                None,
+            ))
+            .unwrap();
+        drop(out_tx);
+
+        let res = run_writer(out_rx, FlushErrorWriter, Arc::clone(&stats), None);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.observations_written, 1); // Line was completely written
+        assert_eq!(snap.write_errors, 1); // Flush error counted
+    }
+
+    #[test]
+    fn writer_handles_partial_anomaly_line_write() {
+        struct FailOnAnomalyWriter {
+            normal_written: bool,
+        }
+        impl Write for FailOnAnomalyWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if !self.normal_written {
+                    self.normal_written = true;
+                    Ok(buf.len())
+                } else {
+                    Err(io::Error::from(io::ErrorKind::BrokenPipe))
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (out_tx, out_rx) = mpsc::channel(10);
+        let stats = DetectionStats::new_shared();
+
+        let batch = OutputBatch::new(
+            b"normal_line\n".to_vec().into_boxed_slice(),
+            Some(b"anomaly_line\n".to_vec().into_boxed_slice()),
+        );
+        out_tx.try_send(batch).unwrap();
+        drop(out_tx);
+
+        let writer = FailOnAnomalyWriter {
+            normal_written: false,
+        };
+        let res = run_writer(out_rx, writer, Arc::clone(&stats), None);
+        assert!(res.is_err());
+
+        let snap = stats.snapshot();
+        // Normal line succeeded
+        assert_eq!(snap.observations_written, 1);
+        // Anomaly line failed midway: never counted as written
+        assert_eq!(snap.events_written, 0);
+        assert_eq!(snap.write_errors, 1);
+    }
+
+    #[test]
+    fn stdout_failure_allows_coordinator_to_continue_and_count_closed_drops() {
+        let (obs_tx, obs_rx) = mpsc::channel(10);
+        let (out_tx, out_rx) = mpsc::channel(10);
+        let config = DetectionConfig::new(500).unwrap();
+        let detector = Detector::new(config);
+        let stats = DetectionStats::new_shared();
+
+        // Simulate writer dying / closing receiver early
+        drop(out_rx);
+
+        // Send 3 observations after writer died
+        for _ in 0..3 {
+            obs_tx
+                .try_send(Observation::new(
+                    UNIX_EPOCH,
+                    "svc".into(),
+                    Method::GET,
+                    "/after_death",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Duration::from_millis(10),
+                    RequestOutcome::Success,
+                ))
+                .unwrap();
+        }
+        drop(obs_tx);
+
+        run_coordinator(obs_rx, out_tx, detector, Arc::clone(&stats), None);
+
+        let snap = stats.snapshot();
+        // Coordinator continued classifying despite dead stdout
+        assert_eq!(snap.evaluated, 3);
+        assert_eq!(snap.anomalous, 3);
+        assert_eq!(snap.batches_queued, 0);
+        assert_eq!(snap.observations_output_dropped_closed, 3);
+        assert_eq!(snap.events_dropped_closed, 3);
+    }
+
+    #[tokio::test]
+    async fn shutdown_distinguishes_coordinator_failure_from_clean_drain() {
+        let config = DetectionConfig::new(500).unwrap();
+        let detector = Detector::new(config);
+        let stats = DetectionStats::new_shared();
+
+        struct DevNull;
+        impl Write for DevNull {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Spawn pipeline near MAX sequence to test coordinator failure in shutdown
+        let (pipeline, tx) = TelemetryPipeline::spawn_with_initial_seq(
+            10,
+            detector,
+            DevNull,
+            Arc::clone(&stats),
+            u64::MAX,
+        )
+        .unwrap();
+
+        // 1st request: seq = u64::MAX
+        tx.try_send(Observation::new(
+            UNIX_EPOCH,
+            "orders".into(),
+            Method::GET,
+            "/req1",
+            StatusCode::OK,
+            Duration::from_millis(10),
+            RequestOutcome::Success,
+        ))
+        .unwrap();
+
+        // 2nd request: triggers sequence overflow in coordinator
+        tx.try_send(Observation::new(
+            UNIX_EPOCH,
+            "orders".into(),
+            Method::GET,
+            "/req2",
+            StatusCode::OK,
+            Duration::from_millis(10),
+            RequestOutcome::Success,
+        ))
+        .unwrap();
+
+        drop(tx);
+
+        let res = pipeline.shutdown(Duration::from_secs(2)).await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("sequence overflow"));
     }
 }

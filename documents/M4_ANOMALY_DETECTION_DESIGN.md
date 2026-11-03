@@ -1,10 +1,10 @@
 # M4 — Deterministic HTTP anomaly detection
 
-Status: **M4.1 pure detection model implemented; M4.2–M4.5 remain unimplemented and are not authorized by this document**.
+Status: **M4.1 pure detection model and M4.2 pipeline integration implemented; M4.2 remains CLI-inactive until M4.3; M4.3–M4.5 remain unimplemented and are not authorized by this document**.
 
-Design date: 23 October 2026 (Asia/Calcutta). Source baseline: `origin/main` at `6c862edb86e88abd9ef1d6ede80d14a6821743d8`. Design branch: `m4-anomaly-detection`. Both the M3 merge and repository-standards merge are ancestors of this baseline. The original design-only change added this document without runtime code. M4.1 was subsequently authorized separately and implemented in `core/src/detection.rs`, with its module export in `core/src/lib.rs`, through commit `8cb673a584431f79527e80ca089c2ad048c2b1e0`.
+Design date: 23 October 2026 (Asia/Calcutta). Source baseline: `origin/main` at `6c862edb86e88abd9ef1d6ede80d14a6821743d8`. Design branch: `m4-anomaly-detection`. Both the M3 merge and repository-standards merge are ancestors of this baseline. The original design-only change added this document without runtime code. M4.1 was subsequently authorized separately and implemented in `core/src/detection.rs`, with its module export in `core/src/lib.rs`, through commit `8cb673a584431f79527e80ca089c2ad048c2b1e0`. M4.2 was implemented in `cli/src/reporting.rs` under feature branch `m4-pipeline`.
 
-Implementation-status review: 28 October 2026. M4.1 includes immutable validated configuration, pure rule evaluation, scalar-only anomaly evidence, and deterministic model tests. It adds no HTTP integration, workers, queues, counters, CLI flags, or anomaly output. Those parts of the design below remain proposals for later phases. Verification results must identify their exact commit and environment; implementation status alone is not a security or merge-readiness guarantee.
+Implementation-status review: 3 November 2026. M4.1 includes immutable validated configuration, pure rule evaluation, scalar-only anomaly evidence, and deterministic model tests. M4.2 implements the consumer-side telemetry pipeline (`OutputBatch`, `DetectionStats` race-safe saturating atomic counters, non-blocking `run_coordinator` with sequence overflow prevention, `run_writer` with complete-line accounting, and `TelemetryPipeline` single-deadline supervision). M4.2 remains internal and CLI-inactive until M4.3 wires public CLI flags and presentation. Those subsequent parts of the design below remain proposals for later phases. Verification results must identify their exact commit and environment; implementation status alone is not a security or merge-readiness guarantee.
 
 ## 1. Executive summary
 
