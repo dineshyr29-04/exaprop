@@ -995,4 +995,222 @@ mod tests {
         // Shared deadline enforced: aborted around 50ms, did not hang indefinitely
         assert!(elapsed < Duration::from_millis(500));
     }
+
+    #[tokio::test]
+    async fn clean_pipeline_drain_settles_all_counter_invariants() {
+        let config = DetectionConfig::new(500).unwrap();
+        let detector = Detector::new(config);
+        let stats = DetectionStats::new_shared();
+
+        struct DevNull;
+        impl Write for DevNull {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (pipeline, tx) =
+            TelemetryPipeline::spawn(20, detector, DevNull, Arc::clone(&stats)).unwrap();
+
+        // 1. Normal fast 200
+        tx.try_send(Observation::new(
+            UNIX_EPOCH,
+            "orders".into(),
+            Method::GET,
+            "/health",
+            StatusCode::OK,
+            Duration::from_millis(20),
+            RequestOutcome::Success,
+        ))
+        .unwrap();
+
+        // 2. Normal 404 (not an anomaly)
+        tx.try_send(Observation::new(
+            UNIX_EPOCH,
+            "orders".into(),
+            Method::GET,
+            "/not_found",
+            StatusCode::NOT_FOUND,
+            Duration::from_millis(15),
+            RequestOutcome::Success,
+        ))
+        .unwrap();
+
+        // 3. Anomaly: 500 Internal Server Error
+        tx.try_send(Observation::new(
+            UNIX_EPOCH,
+            "orders".into(),
+            Method::POST,
+            "/charge",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Duration::from_millis(50),
+            RequestOutcome::Success,
+        ))
+        .unwrap();
+
+        // 4. Anomaly: Elevated duration (800ms > 500ms)
+        tx.try_send(Observation::new(
+            UNIX_EPOCH,
+            "orders".into(),
+            Method::GET,
+            "/slow",
+            StatusCode::OK,
+            Duration::from_millis(800),
+            RequestOutcome::Success,
+        ))
+        .unwrap();
+
+        // 5. Anomaly: Upstream Timeout
+        tx.try_send(Observation::new(
+            UNIX_EPOCH,
+            "orders".into(),
+            Method::GET,
+            "/timeout",
+            StatusCode::GATEWAY_TIMEOUT,
+            Duration::from_millis(5000),
+            RequestOutcome::BackendTimeout,
+        ))
+        .unwrap();
+
+        drop(tx);
+
+        let snap = pipeline.shutdown(Duration::from_secs(2)).await.unwrap();
+
+        assert_eq!(snap.evaluated, 5);
+        assert_eq!(snap.normal, 2);
+        assert_eq!(snap.anomalous, 3);
+        assert_eq!(snap.matches_http_server_error, 2); // 500 and 504 are both in 500..=599
+        assert_eq!(snap.matches_elevated_request_duration, 2); // 800ms and 5000ms
+        assert_eq!(snap.matches_upstream_timeout, 1);
+        assert_eq!(snap.batches_queued, 5);
+        assert_eq!(snap.events_queued, 3);
+        assert_eq!(snap.observations_written, 5);
+        assert_eq!(snap.events_written, 3);
+        assert_eq!(snap.observations_unconfirmed(), 0);
+        assert_eq!(snap.events_unconfirmed(), 0);
+        assert!(snap.check_settled_invariants().is_ok());
+    }
+
+    #[test]
+    fn byte_limits_and_truncation_accounting() {
+        let long_path = "/path/".repeat(1000); // 6,000 bytes
+        let obs = Observation::new(
+            UNIX_EPOCH,
+            "svc".into(),
+            Method::GET,
+            &long_path,
+            StatusCode::OK,
+            Duration::from_millis(10),
+            RequestOutcome::Success,
+        );
+
+        let (line, truncated) = render_normal_line(1, &obs);
+        assert!(truncated);
+        assert!(line.len() <= NORMAL_LINE_CAP);
+        assert!(line.ends_with(b"\n"));
+        let line_str = std::str::from_utf8(&line).unwrap();
+        assert!(line_str.contains("truncated_fields=path"));
+    }
+
+    #[test]
+    fn anomaly_line_contains_zero_url_or_header_payloads() {
+        let (obs_tx, obs_rx) = mpsc::channel(10);
+        let (out_tx, mut out_rx) = mpsc::channel(10);
+        let config = DetectionConfig::new(500).unwrap();
+        let detector = Detector::new(config);
+        let stats = DetectionStats::new_shared();
+
+        let mut obs = Observation::new(
+            UNIX_EPOCH,
+            "sensitive-service".into(),
+            Method::POST,
+            "/internal/admin/secret_account",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Duration::from_millis(600),
+            RequestOutcome::Success,
+        );
+        obs.query = Some("session_token=super_secret_token_12345".into());
+
+        obs_tx.try_send(obs).unwrap();
+        drop(obs_tx);
+
+        run_coordinator(obs_rx, out_tx, detector, stats, None);
+
+        let batch = out_rx.try_recv().unwrap();
+        let normal_str = std::str::from_utf8(&batch.normal_line).unwrap();
+        assert!(normal_str.contains("/internal/admin/secret_account"));
+
+        let anomaly_str = std::str::from_utf8(batch.anomaly_line.as_ref().unwrap()).unwrap();
+        // Crucial security invariant: URLs, query parameters, and paths are completely excluded
+        assert!(!anomaly_str.contains("/internal"));
+        assert!(!anomaly_str.contains("admin"));
+        assert!(!anomaly_str.contains("secret_account"));
+        assert!(!anomaly_str.contains("session_token"));
+        assert!(!anomaly_str.contains("super_secret_token_12345"));
+
+        // Scalar facts are preserved accurately
+        assert!(anomaly_str.contains("service=\"sensitive-service\""));
+        assert!(anomaly_str.contains("method=\"POST\""));
+        assert!(anomaly_str.contains("status=500"));
+        assert!(anomaly_str.contains("reasons=http_server_error,elevated_request_duration"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_counter_snapshots_are_monotonic() {
+        let config = DetectionConfig::new(500).unwrap();
+        let detector = Detector::new(config);
+        let stats = DetectionStats::new_shared();
+
+        struct DevNull;
+        impl Write for DevNull {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (pipeline, tx) =
+            TelemetryPipeline::spawn(100, detector, DevNull, Arc::clone(&stats)).unwrap();
+
+        let snapshot_stats = Arc::clone(&stats);
+        let monitor = tokio::spawn(async move {
+            let mut last_written = 0;
+            for _ in 0..50 {
+                let snap = snapshot_stats.snapshot();
+                assert!(snap.observations_written >= last_written);
+                last_written = snap.observations_written;
+                assert!(snap.observations_unconfirmed() <= snap.batches_queued);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        for i in 0..50 {
+            let obs = Observation::new(
+                UNIX_EPOCH,
+                "bench".into(),
+                Method::GET,
+                "/ping",
+                if i % 2 == 0 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+                Duration::from_millis(10),
+                RequestOutcome::Success,
+            );
+            tx.try_send(obs).unwrap();
+        }
+        drop(tx);
+
+        let (snap, _) = tokio::join!(pipeline.shutdown(Duration::from_secs(2)), monitor);
+        let final_snap = snap.unwrap();
+        assert_eq!(final_snap.evaluated, 50);
+        assert_eq!(final_snap.observations_written, 50);
+        assert!(final_snap.check_settled_invariants().is_ok());
+    }
 }
