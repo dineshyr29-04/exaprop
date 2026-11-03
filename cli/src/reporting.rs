@@ -4,6 +4,7 @@
 //! `Observation` receiver -> Coordinator -> Bounded `OutputBatch` queue -> Dedicated Writer.
 
 use std::{
+    io::{self, Write},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -522,6 +523,55 @@ pub fn run_coordinator(
     }
 }
 
+/// Dedicated stdout writer worker consuming pre-rendered batches from the output queue,
+/// writing complete lines to the sink, and accounting for completed lines and I/O errors.
+pub fn run_writer(
+    mut output_rx: mpsc::Receiver<OutputBatch>,
+    mut writer: impl Write,
+    stats: Arc<DetectionStats>,
+    done_tx: Option<oneshot::Sender<io::Result<()>>>,
+) -> io::Result<()> {
+    let mut write_res = Ok(());
+
+    while let Some(batch) = output_rx.blocking_recv() {
+        if let Err(e) = writer.write_all(&batch.normal_line) {
+            stats.inc(&stats.write_errors);
+            write_res = Err(e);
+            break;
+        }
+        stats.inc(&stats.observations_written);
+
+        if let Some(ref anomaly) = batch.anomaly_line {
+            if let Err(e) = writer.write_all(anomaly) {
+                stats.inc(&stats.write_errors);
+                write_res = Err(e);
+                break;
+            }
+            stats.inc(&stats.events_written);
+        }
+    }
+
+    // Drop receiver to close channel if we broke out on error
+    drop(output_rx);
+
+    let final_res = match write_res {
+        Ok(()) => writer.flush().inspect_err(|_| {
+            stats.inc(&stats.write_errors);
+        }),
+        Err(e) => Err(e),
+    };
+
+    if let Some(tx) = done_tx {
+        let res = match &final_res {
+            Ok(()) => Ok(()),
+            Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+        };
+        let _ = tx.send(res);
+    }
+
+    final_res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,5 +761,65 @@ mod tests {
         assert_eq!(snap.normal, 1);
         assert_eq!(snap.batches_queued, 0);
         assert_eq!(snap.observations_output_dropped_closed, 1);
+    }
+
+    #[test]
+    fn writer_writes_all_batches_and_flushes() {
+        let (out_tx, out_rx) = mpsc::channel(10);
+        let stats = DetectionStats::new_shared();
+
+        let batch1 = OutputBatch::new(b"line1\n".to_vec().into_boxed_slice(), None);
+        let batch2 = OutputBatch::new(
+            b"line2\n".to_vec().into_boxed_slice(),
+            Some(b"anomaly2\n".to_vec().into_boxed_slice()),
+        );
+
+        out_tx.try_send(batch1).unwrap();
+        out_tx.try_send(batch2).unwrap();
+        drop(out_tx);
+
+        let mut sink = Vec::new();
+        let res = run_writer(out_rx, &mut sink, Arc::clone(&stats), None);
+        assert!(res.is_ok());
+
+        let sink_str = String::from_utf8(sink).unwrap();
+        assert_eq!(sink_str, "line1\nline2\nanomaly2\n");
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.observations_written, 2);
+        assert_eq!(snap.events_written, 1);
+        assert_eq!(snap.write_errors, 0);
+    }
+
+    #[test]
+    fn writer_stops_on_broken_pipe_and_records_write_error() {
+        struct BrokenPipeWriter;
+        impl Write for BrokenPipeWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (out_tx, out_rx) = mpsc::channel(10);
+        let stats = DetectionStats::new_shared();
+
+        let batch = OutputBatch::new(b"normal\n".to_vec().into_boxed_slice(), None);
+        out_tx.try_send(batch).unwrap();
+        drop(out_tx);
+
+        let (done_tx, mut done_rx) = oneshot::channel();
+        let res = run_writer(out_rx, BrokenPipeWriter, Arc::clone(&stats), Some(done_tx));
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+
+        let done_res = done_rx.try_recv().unwrap();
+        assert_eq!(done_res.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.observations_written, 0);
+        assert_eq!(snap.events_written, 0);
+        assert_eq!(snap.write_errors, 1);
     }
 }
