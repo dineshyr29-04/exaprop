@@ -302,49 +302,110 @@ pub fn severity_token(sev: Severity) -> &'static str {
     }
 }
 
-/// Escape quotes, backslashes, controls, and non-ASCII characters; bound by byte length.
+/// Formatting exceeded the line budget. No partial line is emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderLimit;
+
+/// Reject writes before they exceed the encoded-byte cap, including in release builds.
+struct BoundedLine {
+    text: String,
+    cap: usize,
+}
+
+impl std::fmt::Write for BoundedLine {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        if value.len() > self.cap.saturating_sub(self.text.len()) {
+            return Err(std::fmt::Error);
+        }
+        self.text.push_str(value);
+        Ok(())
+    }
+}
+
+fn bounded_line(cap: usize, args: std::fmt::Arguments<'_>) -> Result<Box<[u8]>, RenderLimit> {
+    use std::fmt::Write;
+    let mut line = BoundedLine {
+        text: String::with_capacity(cap),
+        cap,
+    };
+    line.write_fmt(args).map_err(|_| RenderLimit)?;
+    Ok(line.text.into_bytes().into_boxed_slice())
+}
+
+/// Escape only complete Unicode characters, without a heap allocation per character.
 pub fn escape_and_bound(s: &str, byte_limit: usize) -> (String, bool) {
-    let mut out = String::new();
+    let mut out = String::with_capacity(byte_limit.min(s.len()));
     let mut truncated = false;
 
     for ch in s.chars() {
+        let mut escaped = [0u8; 16];
+        let mut utf8 = [0u8; 4];
         let esc = match ch {
-            '"' => "\\\"".to_string(),
-            '\\' => "\\\\".to_string(),
-            '\n' => "\\n".to_string(),
-            '\r' => "\\r".to_string(),
-            '\t' => "\\t".to_string(),
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
             c if c.is_ascii_control() || !c.is_ascii() => {
-                let mut buf = [0u8; 4];
-                let encoded = c.encode_utf8(&mut buf);
-                let mut s = String::new();
-                for b in encoded.as_bytes() {
-                    use std::fmt::Write;
-                    let _ = write!(s, "\\x{:02x}", b);
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let encoded = c.encode_utf8(&mut utf8);
+                for (i, b) in encoded.bytes().enumerate() {
+                    escaped[i * 4..i * 4 + 4].copy_from_slice(&[
+                        b'\\',
+                        b'x',
+                        HEX[usize::from(b >> 4)],
+                        HEX[usize::from(b & 15)],
+                    ]);
                 }
-                s
+                // Every byte above is ASCII; use checked conversion to keep this safe Rust.
+                std::str::from_utf8(&escaped[..encoded.len() * 4]).unwrap_or_default()
             }
-            c => c.to_string(),
+            c => c.encode_utf8(&mut utf8),
         };
 
-        if out.len() + esc.len() > byte_limit {
+        if esc.len() > byte_limit.saturating_sub(out.len()) {
             truncated = true;
             break;
         }
-        out.push_str(&esc);
+        out.push_str(esc);
     }
 
     (out, truncated)
 }
 
 /// Render one normal observation line strictly bounded to `NORMAL_LINE_CAP`.
-pub fn render_normal_line(seq: u64, obs: &Observation) -> (Box<[u8]>, bool) {
-    let (service, trunc_service) = escape_and_bound(&obs.service_name, SERVICE_ENCODED_BUDGET);
-    let (method, trunc_method) = escape_and_bound(obs.method.as_str(), METHOD_ENCODED_BUDGET);
-    let (path, trunc_path) = escape_and_bound(&obs.path, PATH_ENCODED_BUDGET);
+/// Returns `RenderLimit` without emitting a partial line if mandatory syntax no longer fits.
+pub fn render_normal_line(seq: u64, obs: &Observation) -> Result<(Box<[u8]>, bool), RenderLimit> {
+    let ts = format_timestamp(obs.timestamp);
+    let duration_ms = format_duration_ms(obs.duration);
+    let outcome = outcome_token(obs.outcome);
+    let render = |service: &str, method: &str, path: &str, query: &str, trunc_str: &str| {
+        bounded_line(NORMAL_LINE_CAP, format_args!(
+        "OBSERVATION_V1 seq={seq} timestamp={ts} service=\"{service}\" method=\"{method}\" path=\"{path}\" {query} status={} outcome={outcome} duration_ms={duration_ms} truncated_fields={trunc_str}\n",
+        obs.status.as_u16()
+        ))
+    };
+    // Reserve syntax, mandatory evidence, newline and the largest truncation marker.
+    let empty_query = if obs.query.is_some() {
+        "query=\"\""
+    } else {
+        "query=none"
+    };
+    let mandatory = render("", "", "", empty_query, "service,method,path_query")?;
+    let mut remaining = NORMAL_LINE_CAP
+        .checked_sub(mandatory.len())
+        .ok_or(RenderLimit)?;
+    let mut field = |value: &str, limit: usize| {
+        let result = escape_and_bound(value, limit.min(remaining));
+        remaining -= result.0.len();
+        result
+    };
+    let (service, trunc_service) = field(&obs.service_name, SERVICE_ENCODED_BUDGET);
+    let (method, trunc_method) = field(obs.method.as_str(), METHOD_ENCODED_BUDGET);
+    let (path, trunc_path) = field(&obs.path, PATH_ENCODED_BUDGET);
     let (query, trunc_query) = match &obs.query {
         Some(q) => {
-            let (eq, tq) = escape_and_bound(q, QUERY_ENCODED_BUDGET);
+            let (eq, tq) = field(q, QUERY_ENCODED_BUDGET);
             (format!("query=\"{eq}\""), tq)
         }
         None => ("query=none".to_string(), false),
@@ -371,45 +432,21 @@ pub fn render_normal_line(seq: u64, obs: &Observation) -> (Box<[u8]>, bool) {
         trunc_fields.join(",")
     };
 
-    let ts = format_timestamp(obs.timestamp);
-    let duration_ms = format_duration_ms(obs.duration);
-    let outcome = outcome_token(obs.outcome);
-
-    let line = format!(
-        "OBSERVATION_V1 seq={seq} timestamp={ts} service=\"{service}\" method=\"{method}\" path=\"{path}\" {query} status={} outcome={outcome} duration_ms={duration_ms} truncated_fields={trunc_str}\n",
-        obs.status.as_u16()
-    );
-
-    let is_truncated = !trunc_fields.is_empty();
-    debug_assert!(
-        line.len() <= NORMAL_LINE_CAP,
-        "normal line length {} exceeds NORMAL_LINE_CAP {}",
-        line.len(),
-        NORMAL_LINE_CAP
-    );
-
-    (line.into_bytes().into_boxed_slice(), is_truncated)
+    let line = render(&service, &method, &path, &query, &trunc_str)?;
+    Ok((line, !trunc_fields.is_empty()))
 }
 
 /// Render one anomaly line strictly bounded to `ANOMALY_LINE_CAP`.
 ///
-/// Contains ONLY scalar evidence fields. URLs, paths, queries, headers, and bodies are excluded.
+/// Contains scalar evidence plus bounded service and method presentation labels.
+/// URLs, paths, queries, headers, and bodies are excluded.
+/// Returns `RenderLimit` if mandatory evidence cannot fit; evidence is never truncated.
 pub fn render_anomaly_line(
     seq: u64,
     service_name: &str,
     method: &Method,
     anomaly: &Anomaly,
-) -> (Box<[u8]>, bool) {
-    let (service, trunc_service) = escape_and_bound(service_name, SERVICE_ENCODED_BUDGET);
-    let (method_str, trunc_method) = escape_and_bound(method.as_str(), METHOD_ENCODED_BUDGET);
-    let mut trunc_fields = Vec::new();
-    if trunc_service {
-        trunc_fields.push("service");
-    }
-    if trunc_method {
-        trunc_fields.push("method");
-    }
-
+) -> Result<(Box<[u8]>, bool), RenderLimit> {
     let reasons: Vec<&'static str> = anomaly.matched_rules().iter().map(reason_token).collect();
     let reasons_str = reasons.join(",");
 
@@ -418,32 +455,44 @@ pub fn render_anomaly_line(
         None => "threshold_ms=none".to_string(),
     };
 
-    let trunc_str = if trunc_fields.is_empty() {
-        "none".to_string()
-    } else {
-        trunc_fields.join(",")
-    };
-
     let ts = format_timestamp(anomaly.timestamp());
     let duration_ms = format_duration_ms(anomaly.duration());
     let outcome = outcome_token(anomaly.outcome());
     let origin = origin_token(anomaly.origin());
     let severity = severity_token(anomaly.severity());
 
-    let line = format!(
+    let render = |service: &str, method_str: &str, trunc_str: &str| {
+        bounded_line(ANOMALY_LINE_CAP, format_args!(
         "ANOMALY_V1 seq={seq} timestamp={ts} service=\"{service}\" method=\"{method_str}\" status={} outcome={outcome} origin={origin} severity={severity} duration_ms={duration_ms} reasons={reasons_str} {threshold_str} truncated_fields={trunc_str}\n",
         anomaly.status().as_u16()
+        ))
+    };
+    let mandatory = render("", "", "service,method")?;
+    let remaining = ANOMALY_LINE_CAP
+        .checked_sub(mandatory.len())
+        .ok_or(RenderLimit)?;
+    let (service, trunc_service) =
+        escape_and_bound(service_name, SERVICE_ENCODED_BUDGET.min(remaining));
+    let (method_str, trunc_method) = escape_and_bound(
+        method.as_str(),
+        METHOD_ENCODED_BUDGET.min(remaining - service.len()),
     );
+    let mut trunc_fields = Vec::new();
+    if trunc_service {
+        trunc_fields.push("service");
+    }
+    if trunc_method {
+        trunc_fields.push("method");
+    }
 
-    let is_truncated = !trunc_fields.is_empty();
-    debug_assert!(
-        line.len() <= ANOMALY_LINE_CAP,
-        "anomaly line length {} exceeds ANOMALY_LINE_CAP {}",
-        line.len(),
-        ANOMALY_LINE_CAP
-    );
+    let trunc_str = if trunc_fields.is_empty() {
+        "none".to_string()
+    } else {
+        trunc_fields.join(",")
+    };
 
-    (line.into_bytes().into_boxed_slice(), is_truncated)
+    let line = render(&service, &method_str, &trunc_str)?;
+    Ok((line, !trunc_fields.is_empty()))
 }
 
 /// Terminal coordinator error.
@@ -451,12 +500,15 @@ pub fn render_anomaly_line(
 pub enum CoordinatorError {
     /// Sequence counter reached `u64::MAX`; telemetry terminated to prevent identifier reuse.
     SequenceOverflow,
+    /// A format change exhausted the line budget; no partial batch was submitted.
+    RenderLimit,
 }
 
 impl std::fmt::Display for CoordinatorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SequenceOverflow => write!(f, "sequence overflow"),
+            Self::RenderLimit => write!(f, "telemetry line budget exceeded"),
         }
     }
 }
@@ -525,24 +577,32 @@ pub fn run_coordinator_with_initial_seq(
             false
         };
 
-        let (normal_line, normal_trunc) = render_normal_line(current_seq, &obs);
-        if normal_trunc {
-            stats.inc(&stats.truncated_observations);
-        }
-
-        let anomaly_line = maybe_anomaly.map(|anomaly| {
-            let (line, trunc) =
-                render_anomaly_line(current_seq, &obs.service_name, &obs.method, &anomaly);
-            if trunc {
-                stats.inc(&stats.truncated_events);
+        let rendered = (|| -> Result<OutputBatch, RenderLimit> {
+            let (normal_line, normal_trunc) = render_normal_line(current_seq, &obs)?;
+            if normal_trunc {
+                stats.inc(&stats.truncated_observations);
             }
-            line
-        });
-
-        // Drop observation immediately to release variable-sized strings
+            let anomaly_line = match maybe_anomaly {
+                Some(anomaly) => {
+                    let (line, trunc) =
+                        render_anomaly_line(current_seq, &obs.service_name, &obs.method, &anomaly)?;
+                    if trunc {
+                        stats.inc(&stats.truncated_events);
+                    }
+                    Some(line)
+                }
+                None => None,
+            };
+            Ok(OutputBatch::new(normal_line, anomaly_line))
+        })();
         drop(obs);
-
-        let batch = OutputBatch::new(normal_line, anomaly_line);
+        let batch = match rendered {
+            Ok(batch) => batch,
+            Err(RenderLimit) => {
+                terminal_error = Some(CoordinatorError::RenderLimit);
+                break;
+            }
+        };
 
         match output_tx.try_send(batch) {
             Ok(()) => {
@@ -834,6 +894,99 @@ mod tests {
     use core_engine::{
         detection::DetectionConfig, Method, Observation, RequestOutcome, StatusCode,
     };
+
+    #[test]
+    fn bounded_construction_rejects_overflow_in_all_profiles() {
+        use std::fmt::Write;
+        let mut line = BoundedLine {
+            text: String::new(),
+            cap: 4,
+        };
+        line.write_str("abc").unwrap();
+        assert!(line.write_str("de").is_err());
+        assert_eq!(line.text, "abc");
+        line.write_str("\n").unwrap();
+        assert_eq!(line.text.as_bytes(), b"abc\n");
+        assert_eq!(
+            bounded_line(4, format_args!("{}\n", "abc"))
+                .unwrap()
+                .as_ref(),
+            b"abc\n"
+        );
+        assert_eq!(
+            bounded_line(3, format_args!("{}\n", "abc")),
+            Err(RenderLimit)
+        );
+    }
+
+    #[test]
+    fn escaping_preserves_complete_characters_at_every_byte_boundary() {
+        let source = "\"\\\n\r\t\0\x1b🦀";
+        let tokens = [
+            "\\\"",
+            "\\\\",
+            "\\n",
+            "\\r",
+            "\\t",
+            "\\x00",
+            "\\x1b",
+            "\\xf0\\x9f\\xa6\\x80",
+        ];
+        for cap in 0..=64 {
+            let mut expected = String::new();
+            for token in tokens {
+                if token.len() > cap - expected.len() {
+                    break;
+                }
+                expected.push_str(token);
+            }
+            let (actual, truncated) = escape_and_bound(source, cap);
+            assert_eq!(actual, expected);
+            assert_eq!(truncated, actual.len() < tokens.concat().len());
+            assert!(actual.len() <= cap);
+        }
+    }
+
+    #[test]
+    fn maximum_scalar_evidence_and_all_variable_fields_fit() {
+        // SystemTime ranges differ between Windows and Linux. Use the largest
+        // power-scaled input supported on the current platform.
+        let timestamp = (0..64)
+            .find_map(|shift| UNIX_EPOCH.checked_add(Duration::from_secs(u64::MAX >> shift)))
+            .unwrap();
+        let mut obs = Observation::new(
+            timestamp,
+            "\x1b🦀\\\"".repeat(1000),
+            Method::from_bytes("X".repeat(1000).as_bytes()).unwrap(),
+            &"/sensitive/🦀\n".repeat(1000),
+            StatusCode::GATEWAY_TIMEOUT,
+            Duration::MAX,
+            RequestOutcome::BackendTimeout,
+        );
+        obs.query = Some("private=🦀\n".repeat(1000));
+        let anomaly = Detector::new(DetectionConfig::default())
+            .evaluate(&obs)
+            .unwrap();
+        let (normal, truncated) = render_normal_line(u64::MAX, &obs).unwrap();
+        assert!(truncated);
+        assert!(normal.len() <= NORMAL_LINE_CAP);
+        let normal = std::str::from_utf8(&normal).unwrap();
+        assert!(normal.ends_with("truncated_fields=service,method,path_query\n"));
+        assert_eq!(normal.matches('\n').count(), 1);
+        let (event, truncated) =
+            render_anomaly_line(u64::MAX, &obs.service_name, &obs.method, &anomaly).unwrap();
+        assert!(truncated);
+        assert!(event.len() <= ANOMALY_LINE_CAP);
+        let event = std::str::from_utf8(&event).unwrap();
+        assert!(event.contains("seq=18446744073709551615"));
+        assert!(
+            event.contains("reasons=http_server_error,elevated_request_duration,upstream_timeout")
+        );
+        assert!(event.contains("threshold_ms=1000"));
+        assert!(event.ends_with("truncated_fields=service,method\n"));
+        assert!(!event.contains("sensitive"));
+        assert!(!event.contains("private"));
+    }
 
     #[test]
     fn startup_gate_requires_commit_and_drop_cancels() {
@@ -1347,7 +1500,7 @@ mod tests {
             RequestOutcome::Success,
         );
 
-        let (line, truncated) = render_normal_line(1, &obs);
+        let (line, truncated) = render_normal_line(1, &obs).unwrap();
         assert!(truncated);
         assert!(line.len() <= NORMAL_LINE_CAP);
         assert!(line.ends_with(b"\n"));
@@ -1572,7 +1725,7 @@ mod tests {
         let detector = Detector::new(config);
         let anomaly = detector.evaluate(&obs).unwrap();
 
-        let (normal_line, normal_trunc) = render_normal_line(42, &obs);
+        let (normal_line, normal_trunc) = render_normal_line(42, &obs).unwrap();
         assert!(normal_trunc);
         assert!(normal_line.len() <= NORMAL_LINE_CAP);
         assert!(normal_line.ends_with(b"\n"));
@@ -1586,7 +1739,7 @@ mod tests {
         assert!(normal_str.contains("truncated_fields="));
 
         let (anomaly_line, anomaly_trunc) =
-            render_anomaly_line(42, &obs.service_name, &obs.method, &anomaly);
+            render_anomaly_line(42, &obs.service_name, &obs.method, &anomaly).unwrap();
         assert!(anomaly_trunc); // Service name exceeded budget
         assert!(anomaly_line.len() <= ANOMALY_LINE_CAP);
         assert!(anomaly_line.ends_with(b"\n"));
