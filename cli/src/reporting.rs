@@ -7,7 +7,7 @@ use std::{
     io::{self, Write},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Condvar, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -636,6 +636,52 @@ pub struct TelemetryPipeline {
     writer_done_rx: oneshot::Receiver<io::Result<()>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartupState {
+    Pending,
+    Started,
+    Cancelled,
+}
+
+/// Dropping an uncommitted startup cancels both workers without joining them.
+/// Cancelled workers only release their captured resources; they never read input or write output.
+struct StartupGate(Arc<(Mutex<StartupState>, Condvar)>);
+
+impl StartupGate {
+    fn new() -> Self {
+        Self(Arc::new((
+            Mutex::new(StartupState::Pending),
+            Condvar::new(),
+        )))
+    }
+
+    fn set(&self, state: StartupState) {
+        let (lock, ready) = &*self.0;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = state;
+        ready.notify_all();
+    }
+
+    fn wait(gate: &Arc<(Mutex<StartupState>, Condvar)>) -> bool {
+        let (lock, ready) = &**gate;
+        let state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let state = ready
+            .wait_while(state, |s| *s == StartupState::Pending)
+            .unwrap_or_else(|e| e.into_inner());
+        *state == StartupState::Started
+    }
+}
+
+impl Drop for StartupGate {
+    fn drop(&mut self) {
+        let (lock, ready) = &*self.0;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if *state == StartupState::Pending {
+            *state = StartupState::Cancelled;
+            ready.notify_all();
+        }
+    }
+}
+
 impl TelemetryPipeline {
     /// Spawn dedicated coordinator and writer threads with bounded queues.
     pub fn spawn<W>(
@@ -661,15 +707,46 @@ impl TelemetryPipeline {
     where
         W: Write + Send + 'static,
     {
+        Self::spawn_with_workers(
+            observation_capacity,
+            detector,
+            writer,
+            stats,
+            initial_seq,
+            |name, worker| {
+                std::thread::Builder::new()
+                    .name(name.into())
+                    .spawn(worker)
+                    .map(drop)
+            },
+        )
+    }
+
+    fn spawn_with_workers<W>(
+        observation_capacity: usize,
+        detector: Detector,
+        writer: W,
+        stats: Arc<DetectionStats>,
+        initial_seq: u64,
+        mut spawn: impl FnMut(&str, Box<dyn FnOnce() + Send>) -> io::Result<()>,
+    ) -> io::Result<(Self, mpsc::Sender<Observation>)>
+    where
+        W: Write + Send + 'static,
+    {
         let (obs_tx, obs_rx) = mpsc::channel(observation_capacity);
         let (out_tx, out_rx) = mpsc::channel(OUTPUT_BATCH_CAPACITY);
         let (coord_done_tx, coord_done_rx) = oneshot::channel();
         let (writer_done_tx, writer_done_rx) = oneshot::channel();
 
+        let startup = StartupGate::new();
+        let coordinator_gate = Arc::clone(&startup.0);
         let coord_stats = Arc::clone(&stats);
-        let coord_handle = std::thread::Builder::new()
-            .name("exaprop-coordinator".into())
-            .spawn(move || {
+        spawn(
+            "exaprop-coordinator",
+            Box::new(move || {
+                if !StartupGate::wait(&coordinator_gate) {
+                    return;
+                }
                 run_coordinator_with_initial_seq(
                     obs_rx,
                     out_tx,
@@ -678,22 +755,23 @@ impl TelemetryPipeline {
                     Some(coord_done_tx),
                     initial_seq,
                 );
-            })?;
+            }),
+        )?;
 
         let writer_stats = Arc::clone(&stats);
-        let _writer_handle = match std::thread::Builder::new()
-            .name("exaprop-writer".into())
-            .spawn(move || {
+        let writer_gate = Arc::clone(&startup.0);
+        spawn(
+            "exaprop-writer",
+            Box::new(move || {
+                if !StartupGate::wait(&writer_gate) {
+                    return;
+                }
                 let _ = run_writer(out_rx, writer, writer_stats, Some(writer_done_tx));
-            }) {
-            Ok(handle) => handle,
-            Err(e) => {
-                // Writer thread spawn failed: clean up coordinator so no worker is leaked.
-                drop(obs_tx);
-                let _ = coord_handle.join();
-                return Err(e);
-            }
-        };
+            }),
+        )?;
+
+        // Only release workers once BOTH spawns succeeded. Any early return cancels them.
+        startup.set(StartupState::Started);
 
         let pipeline = Self {
             observation_tx: obs_tx.clone(),
@@ -756,6 +834,73 @@ mod tests {
     use core_engine::{
         detection::DetectionConfig, Method, Observation, RequestOutcome, StatusCode,
     };
+
+    #[test]
+    fn startup_gate_requires_commit_and_drop_cancels() {
+        for commit in [false, true] {
+            let gate = StartupGate::new();
+            let worker_gate = Arc::clone(&gate.0);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                done_tx.send(StartupGate::wait(&worker_gate)).unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(done_rx.try_recv().is_err());
+            if commit {
+                gate.set(StartupState::Started);
+            }
+            drop(gate);
+            assert_eq!(
+                done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                commit
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_spawn_failures_cancel_created_workers_without_io() {
+        struct NoIo;
+        impl Write for NoIo {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("uncommitted writer ran")
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("uncommitted writer flushed")
+            }
+        }
+        for failing_worker in ["exaprop-coordinator", "exaprop-writer"] {
+            let stats = DetectionStats::new_shared();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let mut handles = Vec::new();
+            let result = TelemetryPipeline::spawn_with_workers(
+                1,
+                Detector::new(DetectionConfig::default()),
+                NoIo,
+                Arc::clone(&stats),
+                1,
+                |name, worker| {
+                    if name == failing_worker {
+                        return Err(io::Error::other("injected spawn failure"));
+                    }
+                    let done = done_tx.clone();
+                    handles.push(std::thread::spawn(move || {
+                        worker();
+                        done.send(()).unwrap();
+                    }));
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            for handle in handles {
+                done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                handle.join().unwrap();
+            }
+            assert_eq!(stats.snapshot(), DetectionStatsSnapshot::default());
+        }
+    }
 
     #[test]
     fn batch_enforces_byte_limits() {
