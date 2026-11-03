@@ -8,8 +8,14 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use core_engine::{
+    detection::{Anomaly, AnomalyKind, Detector, Severity, StatusOrigin},
+    Method, Observation, RequestOutcome,
+};
+use tokio::sync::{mpsc, oneshot};
 
 /// Maximum pre-rendered byte capacity for one normal observation line, including trailing newline.
 pub const NORMAL_LINE_CAP: usize = 4096;
@@ -224,9 +230,304 @@ impl DetectionStatsSnapshot {
     }
 }
 
+/// Format timestamp as signed Unix seconds with 9 decimal places (nanoseconds).
+pub fn format_timestamp(ts: SystemTime) -> String {
+    match ts.duration_since(UNIX_EPOCH) {
+        Ok(dur) => format!("{}.{:09}", dur.as_secs(), dur.subsec_nanos()),
+        Err(err) => {
+            let dur = err.duration();
+            let secs = dur.as_secs();
+            let nanos = dur.subsec_nanos();
+            if nanos == 0 {
+                format!("-{secs}.000000000")
+            } else {
+                format!("-{}.{:09}", secs + 1, 1_000_000_000 - nanos)
+            }
+        }
+    }
+}
+
+/// Format duration in milliseconds with 6 decimal places (microsecond resolution).
+pub fn format_duration_ms(dur: Duration) -> String {
+    let total_ms = dur.as_millis();
+    let micros_frac = (dur.subsec_nanos() % 1_000_000) / 1000;
+    let nanos_frac = dur.subsec_nanos() % 1000;
+    format!("{total_ms}.{micros_frac:03}{nanos_frac:03}")
+}
+
+/// Canonical string token for outcome variants.
+pub fn outcome_token(outcome: RequestOutcome) -> &'static str {
+    match outcome {
+        RequestOutcome::Success => "Success",
+        RequestOutcome::BackendFailure => "BackendFailure",
+        RequestOutcome::BackendTimeout => "BackendTimeout",
+        RequestOutcome::ClientTimeout => "ClientTimeout",
+        RequestOutcome::ClientFailure => "ClientFailure",
+        RequestOutcome::Rejected => "Rejected",
+    }
+}
+
+/// Canonical string token for anomaly rules.
+pub fn reason_token(kind: AnomalyKind) -> &'static str {
+    match kind {
+        AnomalyKind::HttpServerError => "http_server_error",
+        AnomalyKind::ElevatedRequestDuration => "elevated_request_duration",
+        AnomalyKind::UpstreamTimeout => "upstream_timeout",
+    }
+}
+
+/// Canonical string token for status origins.
+pub fn origin_token(origin: StatusOrigin) -> &'static str {
+    match origin {
+        StatusOrigin::BackendResponse => "backend",
+        StatusOrigin::ProxyResponse => "proxy",
+    }
+}
+
+/// Canonical string token for severity levels.
+pub fn severity_token(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Warning => "warning",
+        Severity::Error => "error",
+    }
+}
+
+/// Escape quotes, backslashes, controls, and non-ASCII characters; bound by byte length.
+pub fn escape_and_bound(s: &str, byte_limit: usize) -> (String, bool) {
+    let mut out = String::new();
+    let mut truncated = false;
+
+    for ch in s.chars() {
+        let esc = match ch {
+            '"' => "\\\"".to_string(),
+            '\\' => "\\\\".to_string(),
+            '\n' => "\\n".to_string(),
+            '\r' => "\\r".to_string(),
+            '\t' => "\\t".to_string(),
+            c if c.is_ascii_control() || !c.is_ascii() => {
+                let mut buf = [0u8; 4];
+                let encoded = c.encode_utf8(&mut buf);
+                let mut s = String::new();
+                for b in encoded.as_bytes() {
+                    use std::fmt::Write;
+                    let _ = write!(s, "\\x{:02x}", b);
+                }
+                s
+            }
+            c => c.to_string(),
+        };
+
+        if out.len() + esc.len() > byte_limit {
+            truncated = true;
+            break;
+        }
+        out.push_str(&esc);
+    }
+
+    (out, truncated)
+}
+
+/// Render one normal observation line strictly bounded to `NORMAL_LINE_CAP`.
+pub fn render_normal_line(seq: u64, obs: &Observation) -> (Box<[u8]>, bool) {
+    let (service, trunc_service) = escape_and_bound(&obs.service_name, SERVICE_ENCODED_BUDGET);
+    let (method, trunc_method) = escape_and_bound(obs.method.as_str(), METHOD_ENCODED_BUDGET);
+    let (path, trunc_path) = escape_and_bound(&obs.path, PATH_ENCODED_BUDGET);
+    let (query, trunc_query) = match &obs.query {
+        Some(q) => {
+            let (eq, tq) = escape_and_bound(q, QUERY_ENCODED_BUDGET);
+            (format!("query=\"{eq}\""), tq)
+        }
+        None => ("query=none".to_string(), false),
+    };
+
+    let mut trunc_fields = Vec::new();
+    if trunc_service {
+        trunc_fields.push("service");
+    }
+    if trunc_method {
+        trunc_fields.push("method");
+    }
+    if trunc_path && trunc_query {
+        trunc_fields.push("path_query");
+    } else if trunc_path {
+        trunc_fields.push("path");
+    } else if trunc_query {
+        trunc_fields.push("query");
+    }
+
+    let trunc_str = if trunc_fields.is_empty() {
+        "none".to_string()
+    } else {
+        trunc_fields.join(",")
+    };
+
+    let ts = format_timestamp(obs.timestamp);
+    let duration_ms = format_duration_ms(obs.duration);
+    let outcome = outcome_token(obs.outcome);
+
+    let mut line = format!(
+        "OBSERVATION_V1 seq={seq} timestamp={ts} service=\"{service}\" method=\"{method}\" path=\"{path}\" {query} status={} outcome={outcome} duration_ms={duration_ms} truncated_fields={trunc_str}\n",
+        obs.status.as_u16()
+    );
+
+    let mut is_truncated = !trunc_fields.is_empty();
+    if line.len() > NORMAL_LINE_CAP {
+        is_truncated = true;
+        line.truncate(NORMAL_LINE_CAP - 1);
+        line.push('\n');
+    }
+
+    (line.into_bytes().into_boxed_slice(), is_truncated)
+}
+
+/// Render one anomaly line strictly bounded to `ANOMALY_LINE_CAP`.
+///
+/// Contains ONLY scalar evidence fields. URLs, paths, queries, headers, and bodies are excluded.
+pub fn render_anomaly_line(
+    seq: u64,
+    service_name: &str,
+    method: &Method,
+    anomaly: &Anomaly,
+) -> (Box<[u8]>, bool) {
+    let (service, trunc_service) = escape_and_bound(service_name, SERVICE_ENCODED_BUDGET);
+    let (method_str, trunc_method) = escape_and_bound(method.as_str(), METHOD_ENCODED_BUDGET);
+    let mut trunc_fields = Vec::new();
+    if trunc_service {
+        trunc_fields.push("service");
+    }
+    if trunc_method {
+        trunc_fields.push("method");
+    }
+
+    let reasons: Vec<&'static str> = anomaly.matched_rules().iter().map(reason_token).collect();
+    let reasons_str = reasons.join(",");
+
+    let threshold_str = match anomaly.duration_threshold() {
+        Some(t) => format!("threshold_ms={}", t.as_millis()),
+        None => "threshold_ms=none".to_string(),
+    };
+
+    let trunc_str = if trunc_fields.is_empty() {
+        "none".to_string()
+    } else {
+        trunc_fields.join(",")
+    };
+
+    let ts = format_timestamp(anomaly.timestamp());
+    let duration_ms = format_duration_ms(anomaly.duration());
+    let outcome = outcome_token(anomaly.outcome());
+    let origin = origin_token(anomaly.origin());
+    let severity = severity_token(anomaly.severity());
+
+    let mut line = format!(
+        "ANOMALY_V1 seq={seq} timestamp={ts} service=\"{service}\" method=\"{method_str}\" status={} outcome={outcome} origin={origin} severity={severity} duration_ms={duration_ms} reasons={reasons_str} {threshold_str} truncated_fields={trunc_str}\n",
+        anomaly.status().as_u16()
+    );
+
+    let mut is_truncated = !trunc_fields.is_empty();
+    if line.len() > ANOMALY_LINE_CAP {
+        is_truncated = true;
+        line.truncate(ANOMALY_LINE_CAP - 1);
+        line.push('\n');
+    }
+
+    (line.into_bytes().into_boxed_slice(), is_truncated)
+}
+
+/// Dedicated coordinator worker consuming observations, classifying anomalies,
+/// and dispatching pre-rendered batches to the output queue non-blockingly.
+pub fn run_coordinator(
+    mut observation_rx: mpsc::Receiver<Observation>,
+    output_tx: mpsc::Sender<OutputBatch>,
+    detector: Detector,
+    stats: Arc<DetectionStats>,
+    done_tx: Option<oneshot::Sender<()>>,
+) {
+    let mut seq: u64 = 1;
+
+    while let Some(obs) = observation_rx.blocking_recv() {
+        stats.inc(&stats.evaluated);
+
+        let maybe_anomaly = detector.evaluate(&obs);
+        let is_anomalous = if let Some(ref anomaly) = maybe_anomaly {
+            stats.inc(&stats.anomalous);
+            for rule in anomaly.matched_rules().iter() {
+                match rule {
+                    AnomalyKind::HttpServerError => stats.inc(&stats.matches_http_server_error),
+                    AnomalyKind::ElevatedRequestDuration => {
+                        stats.inc(&stats.matches_elevated_request_duration)
+                    }
+                    AnomalyKind::UpstreamTimeout => stats.inc(&stats.matches_upstream_timeout),
+                }
+            }
+            true
+        } else {
+            stats.inc(&stats.normal);
+            false
+        };
+
+        let current_seq = seq;
+        if seq == u64::MAX {
+            stats.counters_saturated.store(true, Ordering::Relaxed);
+        } else {
+            seq += 1;
+        }
+
+        let (normal_line, normal_trunc) = render_normal_line(current_seq, &obs);
+        if normal_trunc {
+            stats.inc(&stats.truncated_observations);
+        }
+
+        let anomaly_line = maybe_anomaly.map(|anomaly| {
+            let (line, trunc) =
+                render_anomaly_line(current_seq, &obs.service_name, &obs.method, &anomaly);
+            if trunc {
+                stats.inc(&stats.truncated_events);
+            }
+            line
+        });
+
+        // Drop observation immediately to release variable-sized strings
+        drop(obs);
+
+        let batch = OutputBatch::new(normal_line, anomaly_line);
+
+        match output_tx.try_send(batch) {
+            Ok(()) => {
+                stats.inc(&stats.batches_queued);
+                if is_anomalous {
+                    stats.inc(&stats.events_queued);
+                }
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                stats.inc(&stats.observations_output_dropped_full);
+                if is_anomalous {
+                    stats.inc(&stats.events_dropped_full);
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                stats.inc(&stats.observations_output_dropped_closed);
+                if is_anomalous {
+                    stats.inc(&stats.events_dropped_closed);
+                }
+            }
+        }
+    }
+
+    // Drop sole output sender to signal downstream writer
+    drop(output_tx);
+
+    if let Some(tx) = done_tx {
+        let _ = tx.send(());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_engine::{
+        detection::DetectionConfig, Method, Observation, RequestOutcome, StatusCode,
+    };
 
     #[test]
     fn batch_enforces_byte_limits() {
@@ -300,5 +601,115 @@ mod tests {
             stats.check_settled_invariants().unwrap_err(),
             "matches_http_server_error > anomalous"
         );
+    }
+
+    #[test]
+    fn coordinator_processes_observations_and_updates_counters() {
+        let (obs_tx, obs_rx) = mpsc::channel(10);
+        let (out_tx, mut out_rx) = mpsc::channel(10);
+        let config = DetectionConfig::new(500).unwrap();
+        let detector = Detector::new(config);
+        let stats = DetectionStats::new_shared();
+
+        let obs = Observation::new(
+            UNIX_EPOCH + Duration::from_secs(10),
+            "orders-service".into(),
+            Method::GET,
+            "/items",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Duration::from_millis(600),
+            RequestOutcome::Success,
+        );
+
+        obs_tx.try_send(obs).unwrap();
+        drop(obs_tx);
+
+        run_coordinator(obs_rx, out_tx, detector, Arc::clone(&stats), None);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.evaluated, 1);
+        assert_eq!(snap.normal, 0);
+        assert_eq!(snap.anomalous, 1);
+        assert_eq!(snap.matches_http_server_error, 1);
+        assert_eq!(snap.matches_elevated_request_duration, 1);
+        assert_eq!(snap.batches_queued, 1);
+        assert_eq!(snap.events_queued, 1);
+
+        let batch = out_rx.try_recv().unwrap();
+        let normal_str = std::str::from_utf8(&batch.normal_line).unwrap();
+        assert!(normal_str.starts_with("OBSERVATION_V1 seq=1 "));
+        assert!(normal_str.contains("status=500"));
+
+        let anomaly_str = std::str::from_utf8(batch.anomaly_line.as_ref().unwrap()).unwrap();
+        assert!(anomaly_str.starts_with("ANOMALY_V1 seq=1 "));
+        assert!(anomaly_str.contains("reasons=http_server_error,elevated_request_duration"));
+        assert!(anomaly_str.contains("threshold_ms=500"));
+        // URL path is strictly absent from anomaly line
+        assert!(!anomaly_str.contains("/items"));
+    }
+
+    #[test]
+    fn coordinator_drops_batches_on_full_output_queue_without_blocking() {
+        let (obs_tx, obs_rx) = mpsc::channel(10);
+        let (out_tx, _out_rx) = mpsc::channel(1); // Capacity 1
+        let config = DetectionConfig::new(1000).unwrap();
+        let detector = Detector::new(config);
+        let stats = DetectionStats::new_shared();
+
+        // Send 3 observations: first fills the queue, next 2 must be dropped
+        for _ in 0..3 {
+            let obs = Observation::new(
+                UNIX_EPOCH,
+                "svc".into(),
+                Method::GET,
+                "/item",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Duration::from_millis(10),
+                RequestOutcome::Success,
+            );
+            obs_tx.try_send(obs).unwrap();
+        }
+        drop(obs_tx);
+
+        run_coordinator(obs_rx, out_tx, detector, Arc::clone(&stats), None);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.evaluated, 3);
+        assert_eq!(snap.anomalous, 3);
+        assert_eq!(snap.batches_queued, 1);
+        assert_eq!(snap.events_queued, 1);
+        assert_eq!(snap.observations_output_dropped_full, 2);
+        assert_eq!(snap.events_dropped_full, 2);
+    }
+
+    #[test]
+    fn coordinator_handles_closed_output_queue_and_drains_input() {
+        let (obs_tx, obs_rx) = mpsc::channel(10);
+        let (out_tx, out_rx) = mpsc::channel(10);
+        drop(out_rx); // Close output channel before coordinator runs
+
+        let config = DetectionConfig::new(1000).unwrap();
+        let detector = Detector::new(config);
+        let stats = DetectionStats::new_shared();
+
+        let obs = Observation::new(
+            UNIX_EPOCH,
+            "svc".into(),
+            Method::GET,
+            "/closed",
+            StatusCode::OK,
+            Duration::from_millis(10),
+            RequestOutcome::Success,
+        );
+        obs_tx.try_send(obs).unwrap();
+        drop(obs_tx);
+
+        run_coordinator(obs_rx, out_tx, detector, Arc::clone(&stats), None);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.evaluated, 1);
+        assert_eq!(snap.normal, 1);
+        assert_eq!(snap.batches_queued, 0);
+        assert_eq!(snap.observations_output_dropped_closed, 1);
     }
 }
