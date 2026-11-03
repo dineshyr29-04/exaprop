@@ -1,22 +1,22 @@
 <div align="center">
 
-# ⚡ ExaProp
+# ExaProp
 
 **A high-performance, deterministic HTTP reverse proxy and resilience telemetry engine built with Rust.**
 
-[![Status: Active Development](https://img.shields.io/badge/Status-Active_Development-success.svg)](#-milestones--roadmap)
-[![Protocol: RFC 9110](https://img.shields.io/badge/Protocol-RFC_9110_HTTP%2F1.1-informational.svg)](#-key-features)
+[![Status: Active Development](https://img.shields.io/badge/Status-Active_Development-success.svg)](#milestones--roadmap)
+[![Protocol: RFC 9110](https://img.shields.io/badge/Protocol-RFC_9110_HTTP%2F1.1-informational.svg)](#key-features)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust: Stable](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](rust-toolchain.toml)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-[Quick Start](#-quick-start) • [Architecture](#-architecture) • [Features](#-key-features) • [Observability](#-structured-request-observability-m3) • [Anomaly Detection](#-deterministic-anomaly-detection-m41) • [Roadmap](#-milestones--roadmap) • [Contributing](#-contributing)
+[Quick Start](#quick-start) • [Architecture](#architecture) • [Features](#key-features) • [Observability](#structured-request-observability-m3) • [Anomaly Detection](#deterministic-anomaly-detection-m41) • [Roadmap](#milestones--roadmap) • [Contributing](#contributing)
 
 </div>
 
 ---
 
-## 📌 Overview
+## Overview
 
 **ExaProp** is a lightweight, zero-dependency, local HTTP/1.1 reverse proxy and distributed-systems resilience telemetry engine. Operating transparently between clients and upstream microservices, ExaProp records structured, monotonic execution facts and executes pure deterministic anomaly classification—**without ever blocking the request hot path or leaking sensitive payloads.**
 
@@ -24,20 +24,20 @@ Designed for high-concurrency microservice architectures, fault-injection resear
 
 ---
 
-## ✨ Key Features
+## Key Features
 
 | Capability | Engineering Guarantee |
 | :--- | :--- |
-| **⚡ Zero-Blocking Network Core** | Asynchronous Tokio HTTP/1.x forwarding engine; telemetry emission uses non-blocking `try_send` so proxying is never stalled by slow terminal sinks. |
-| **🔍 Bounded Observability (M3)** | Captures monotonic processing durations (`Instant`), HTTP status codes, and typed outcome variants per request into a bounded 1,024-element queue. |
-| **🛡️ Deterministic Anomaly Detection (M4.1)** | Pure, stateless rule classifier evaluating HTTP 5xx errors, strict nanosecond latency boundaries, and upstream timeouts with zero heap allocations. |
-| **🔒 Privacy-Safe Query Redaction** | Automatically detects and masks sensitive parameters (`token`, `secret`, `password`, `api_key`, `auth`) while preserving endpoint telemetry. |
-| **📏 Memory & Resource Bounded** | Fixed 4 MiB body buffering limits, 16 concurrent client caps, bounded diagnostic channels, and deterministic shutdown timeouts. |
-| **📜 Strict RFC 9110 Compliance** | Automatic hop-by-hop header stripping, Connection token validation, Via chain preservation, and proper 204 / 205 / 304 framing. |
+| **Zero-Blocking Network Core** | Asynchronous Tokio HTTP/1.x forwarding engine; telemetry emission uses non-blocking `try_send` so proxying is never stalled by slow terminal sinks. |
+| **Bounded Observability (M3)** | Captures monotonic processing durations (`Instant`), HTTP status codes, and typed outcome variants per request into a bounded 1,024-element queue. |
+| **Deterministic Anomaly Detection (M4.1)** | Pure, stateless rule classifier evaluating HTTP 5xx errors, strict nanosecond latency boundaries, and upstream timeouts with zero heap allocations. |
+| **Privacy-Safe Query Redaction** | Automatically detects and masks sensitive parameters (`token`, `secret`, `password`, `api_key`, `auth`) while preserving endpoint telemetry. |
+| **Memory & Resource Bounded** | Fixed 4 MiB body buffering limits, 16 concurrent client caps, bounded diagnostic channels, and deterministic shutdown timeouts. |
+| **Strict RFC 9110 Compliance** | Automatic hop-by-hop header stripping, Connection token validation, Via chain preservation, and proper 204 / 205 / 304 framing. |
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```text
  ┌──────────────┐             ┌────────────────────────────────────────────────────────┐             ┌─────────────────┐
@@ -72,7 +72,7 @@ Designed for high-concurrency microservice architectures, fault-injection resear
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Prerequisites
 - **Rust Toolchain:** Stable Rust (1.80+) via [rustup](https://rustup.rs/)
@@ -116,7 +116,7 @@ curl -i -X POST -d '{"event":"checkout"}' "http://127.0.0.1:8080/events"
 
 ---
 
-## 🔍 Structured Request Observability (M3)
+## Structured Request Observability (M3)
 
 ExaProp guarantees **at most one observation per handled request**.
 
@@ -136,7 +136,7 @@ ExaProp guarantees **at most one observation per handled request**.
 
 ---
 
-## 🛡️ Deterministic Anomaly Detection (M4.1)
+## Deterministic Anomaly Detection (M4.1)
 
 ExaProp includes a pure, mathematically deterministic anomaly detection engine in [`core/src/detection.rs`](core/src/detection.rs).
 
@@ -152,7 +152,7 @@ ExaProp includes a pure, mathematically deterministic anomaly detection engine i
 
 ---
 
-## 💻 CLI Reference
+## CLI Reference
 
 ```bash
 exaprop attach [OPTIONS]
@@ -168,7 +168,7 @@ exaprop attach [OPTIONS]
 
 ---
 
-## 🔬 Research & Systems Resilience Context
+## Research & Systems Resilience Context
 
 ExaProp is engineered as an empirical testbed for **distributed systems resilience, cascading failure analysis, and fault observability**:
 
@@ -178,24 +178,24 @@ ExaProp is engineered as an empirical testbed for **distributed systems resilien
 
 ---
 
-## 🚦 Milestones & Roadmap
+## Milestones & Roadmap
 
 | Milestone | Focus Area | Status |
 | :--- | :--- | :--- |
-| **M0** | Cargo workspace architecture, linting, and CI pipelines | ✅ Completed |
-| **M1** | Non-blocking HTTP reverse proxy engine & CLI attachment | ✅ Completed |
-| **M2** | HTTP/1.1 correctness, body caps, hop headers & connection limits | ✅ Completed |
-| **M3** | Structured request observability & privacy-safe query redaction | ✅ Completed |
-| **M4.1** | Pure deterministic anomaly detection model & scalar invariants | ✅ Completed |
-| **M4.2** | Consumer-side pipeline coordinator, bounded queues & worker isolation | 🔄 In Progress |
-| **M4.3** | CLI anomaly reporting flags (`--detect`) and V1 telemetry formatting | 📋 Planned |
-| **M4.4** | End-to-end integration verification under simulated upstream faults | 📋 Planned |
-| **M4.5** | Production hardening, audit validation, and telemetry benchmarks | 📋 Planned |
-| **M5+** | Controlled fault injection, chaos orchestration & resilience metrics | 🔭 Research Horizon |
+| **M0** | Cargo workspace architecture, linting, and CI pipelines | Completed |
+| **M1** | Non-blocking HTTP reverse proxy engine & CLI attachment | Completed |
+| **M2** | HTTP/1.1 correctness, body caps, hop headers & connection limits | Completed |
+| **M3** | Structured request observability & privacy-safe query redaction | Completed |
+| **M4.1** | Pure deterministic anomaly detection model & scalar invariants | Completed |
+| **M4.2** | Consumer-side pipeline coordinator, bounded queues & worker isolation | In Progress |
+| **M4.3** | CLI anomaly reporting flags (`--detect`) and V1 telemetry formatting | Planned |
+| **M4.4** | End-to-end integration verification under simulated upstream faults | Planned |
+| **M4.5** | Production hardening, audit validation, and telemetry benchmarks | Planned |
+| **M5+** | Controlled fault injection, chaos orchestration & resilience metrics | Research Horizon |
 
 ---
 
-## 🛠️ Development & Verification
+## Development & Verification
 
 ExaProp maintains rigorous code quality and security standards. Verify the workspace locally using:
 
@@ -218,7 +218,7 @@ cargo doc --workspace --no-deps --locked
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Contributions, bug reports, and research discussions are warmly welcomed!
 
@@ -228,7 +228,7 @@ Contributions, bug reports, and research discussions are warmly welcomed!
 
 ---
 
-## 📄 License
+## License
 
 ExaProp is licensed under the [Apache License, Version 2.0](LICENSE).  
 Copyright (c) 2026 Dinesh Y R & ExaProp Contributors.
