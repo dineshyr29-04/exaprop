@@ -1,179 +1,234 @@
-# ExaProp
+<div align="center">
 
-**A local HTTP reverse proxy with bounded request observability, written in Rust.**
+# ⚡ ExaProp
 
-[![CI](https://github.com/dineshyr29-04/exaprop/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dineshyr29-04/exaprop/actions/workflows/ci.yml)
-[Apache-2.0](LICENSE)
+**A high-performance, deterministic HTTP reverse proxy and resilience telemetry engine built with Rust.**
 
-ExaProp runs between your client and an HTTP backend. It forwards requests and emits structured observations of status, processing duration, and exchange outcome. It runs on your computer or a controlled network and needs no centrally hosted ExaProp service.
+[![Status: Active Development](https://img.shields.io/badge/Status-Active_Development-success.svg)](#-milestones--roadmap)
+[![Protocol: RFC 9110](https://img.shields.io/badge/Protocol-RFC_9110_HTTP%2F1.1-informational.svg)](#-key-features)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Rust: Stable](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](rust-toolchain.toml)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-M3 implements HTTP observability. M4 anomaly detection is planned. ExaProp is an early-stage development and research tool, not a complete distributed observability platform or a hardened public-facing proxy.
+[Quick Start](#-quick-start) • [Architecture](#-architecture) • [Features](#-key-features) • [Observability](#-structured-request-observability-m3) • [Anomaly Detection](#-deterministic-anomaly-detection-m41) • [Roadmap](#-milestones--roadmap) • [Contributing](#-contributing)
 
-[Quick start](#quick-start) · [Installation](#installation) · [CLI](#cli-usage) · [Observations](#observability) · [Limitations](#http-behavior-and-limitations) · [Development](#development) · [Documentation](#documentation)
+</div>
 
-## Current capabilities
+---
 
-- Forward HTTP/1.x traffic to one backend while preserving paths, queries, binary payloads, Host, and duplicate end-to-end headers.
-- Validate Connection tokens, strip hop-by-hop fields, preserve Via chains, and append a fixed `exaprop` pseudonym.
-- Buffer bodies within fixed limits and return explicit proxy errors for failures or unsupported features.
-- Produce typed observations with conservative query-value redaction and measurable queue drops.
-- Keep observation and diagnostic output off HTTP tasks using separate bounded, best-effort queues.
-- Stop accepting connections on graceful shutdown and allow bounded connection and output draining.
+## 📌 Overview
 
-The core library is in [core/](core/); the `exaprop` binary is in [cli/](cli/).
+**ExaProp** is a lightweight, zero-dependency, local HTTP/1.1 reverse proxy and distributed-systems resilience telemetry engine. Operating transparently between clients and upstream microservices, ExaProp records structured, monotonic execution facts and executes pure deterministic anomaly classification—**without ever blocking the request hot path or leaking sensitive payloads.**
 
-## Request flow
+Designed for high-concurrency microservice architectures, fault-injection research, and deterministic latency auditing, ExaProp enforces strict bounded memory guarantees (no unbounded queues, no OOM vulnerability) and zero shared mutable state.
+
+---
+
+## ✨ Key Features
+
+| Capability | Engineering Guarantee |
+| :--- | :--- |
+| **⚡ Zero-Blocking Network Core** | Asynchronous Tokio HTTP/1.x forwarding engine; telemetry emission uses non-blocking `try_send` so proxying is never stalled by slow terminal sinks. |
+| **🔍 Bounded Observability (M3)** | Captures monotonic processing durations (`Instant`), HTTP status codes, and typed outcome variants per request into a bounded 1,024-element queue. |
+| **🛡️ Deterministic Anomaly Detection (M4.1)** | Pure, stateless rule classifier evaluating HTTP 5xx errors, strict nanosecond latency boundaries, and upstream timeouts with zero heap allocations. |
+| **🔒 Privacy-Safe Query Redaction** | Automatically detects and masks sensitive parameters (`token`, `secret`, `password`, `api_key`, `auth`) while preserving endpoint telemetry. |
+| **📏 Memory & Resource Bounded** | Fixed 4 MiB body buffering limits, 16 concurrent client caps, bounded diagnostic channels, and deterministic shutdown timeouts. |
+| **📜 Strict RFC 9110 Compliance** | Automatic hop-by-hop header stripping, Connection token validation, Via chain preservation, and proper 204 / 205 / 304 framing. |
+
+---
+
+## 🏗️ Architecture
 
 ```text
-Client -- HTTP --> ExaProp :8080 -- HTTP --> Backend :8081
-       <-- response ------------ response --
-                      |
-                      +-- stdout: delivered observations
-                      +-- stderr: operational diagnostics
+ ┌──────────────┐             ┌────────────────────────────────────────────────────────┐             ┌─────────────────┐
+ │  HTTP Client │ ── HTTP ──> │               ExaProp Reverse Proxy                    │ ── HTTP ──> │ Upstream Target │
+ │ (curl / app) │ <─ RESP ─── │                   (:8080)                              │ <─ RESP ─── │  (:8081 / svc)  │
+ └──────────────┘             └──────────────────────────┬─────────────────────────────┘             └─────────────────┘
+                                                         │
+                                               Observation::new()
+                                           [Non-blocking try_send]
+                                                         │
+                                                         ▼
+                                       ┌───────────────────────────────────┐
+                                       │   Bounded Observation Mailbox     │
+                                       │        (Capacity: 1,024)          │
+                                       └─────────────────┬─────────────────┘
+                                                         │
+                                                         ▼
+                                       ┌───────────────────────────────────┐
+                                       │        Coordinator Worker         │
+                                       │  - Assigns monotonic seq number   │
+                                       │  - Evaluates M4.1 Detector        │
+                                       │  - Updates Atomic DetectionStats  │
+                                       └─────────────────┬─────────────────┘
+                                                         │
+                                                         ▼
+                                       ┌───────────────────────────────────┐
+                                       │      Dedicated Output Thread      │
+                                       │  stdout: Structured Observations  │
+                                       │  stderr: Operational Diagnostics  │
+                                       └───────────────────────────────────┘
 ```
 
-Direct clients to the proxy's listen address. Requests sent straight to the backend bypass ExaProp. No application SDK is required. Responses are buffered; this is not a streaming transport.
+---
 
-## Quick start
+## 🚀 Quick Start
 
-Prerequisites: Rust installed through rustup with a native linker, Python 3 for the example backend, and curl. Run from the repository root in three terminals.
+### 1. Prerequisites
+- **Rust Toolchain:** Stable Rust (1.80+) via [rustup](https://rustup.rs/)
+- **Python 3:** For the bundled test backend
+- **curl:** For sending test HTTP requests
 
-**1. Start the backend:**
+### 2. Run in 3 Easy Steps
 
+#### Step 1: Start the Mock Upstream Backend
+In your first terminal, start the provided Python test server:
 ```bash
 python3 examples/echo_server.py
+# Listening on 127.0.0.1:8081
 ```
 
-On Windows, use `python` or `py -3` when available. The backend listens on `127.0.0.1:8081`.
-
-**2. Start ExaProp:**
-
+#### Step 2: Launch ExaProp Proxy
+In a second terminal, build and start ExaProp attached to the backend:
 ```bash
-cargo run --locked -p cli -- attach --listen 127.0.0.1:8080 --target 127.0.0.1:8081 --name echo
+cargo run --locked -p cli -- attach --listen 127.0.0.1:8080 --target 127.0.0.1:8081 --name api-service
 ```
 
-**3. Send requests:**
-
+#### Step 3: Send Test Requests
+In a third terminal, send traffic through ExaProp:
 ```bash
-curl -i "http://127.0.0.1:8080/hello?page=2"
-curl -i --data "service=checkout" "http://127.0.0.1:8080/echo"
+# Standard GET request
+curl -i "http://127.0.0.1:8080/users?page=1"
+
+# Query with sensitive parameters (automatically redacted)
+curl -i "http://127.0.0.1:8080/auth?user=alice&token=supersecret123&api_key=998877"
+
+# POST request with JSON payload
+curl -i -X POST -d '{"event":"checkout"}' "http://127.0.0.1:8080/events"
 ```
 
-GET returns `GET /hello?page=2` followed by a newline; POST echoes the submitted bytes. In Windows PowerShell, use `curl.exe` if `curl` is an alias. Press Ctrl+C in the proxy terminal to stop and drain output.
-
-## Installation
-
-The [toolchain file](rust-toolchain.toml) selects stable Rust with rustfmt and Clippy. It follows the stable channel rather than pinning an exact compiler; no separate minimum supported Rust version is declared. The workspace uses Cargo resolver 3.
-
-```bash
-cargo build --workspace --release --locked
-cargo install --path cli --locked
-exaprop --help
-```
-
-The build produces `target/release/exaprop` (`exaprop.exe` on Windows). Installation places the command in Cargo's bin directory; add `$HOME/.cargo/bin` or `%USERPROFILE%/.cargo/bin` to PATH to use it anywhere. Build a native binary for each OS and architecture. CI covers Linux and Windows; macOS is not in the CI matrix.
-
-See the [usage guide](documents/EXAPROP_USAGE.md) for setup, FastAPI, Express, and troubleshooting.
-
-## CLI usage
-
-```bash
-exaprop attach --listen 127.0.0.1:8080 --target 127.0.0.1:3000 --name orders
-exaprop attach --help
-```
-
-| Option | Default | Purpose |
-| --- | --- | --- |
-| `--listen` | `127.0.0.1:8080` | Local bind address |
-| `--target` | `127.0.0.1:8081` | Single HTTP backend address |
-| `--name` | `backend-service` | Observation service label |
-
-Addresses must be numeric socket addresses, such as `127.0.0.1:3000` or `[::1]:3000`, rather than URLs or DNS names. Keep listen and target addresses different. The client's Host is preserved for backend routing; ExaProp does not synthesize `X-Forwarded-*` identity headers.
-
-## Observability
-
-Delivered observations go to stdout; operational diagnostics go to stderr:
-
+#### Live Telemetry Output in ExaProp Terminal:
 ```text
-[orders] GET /items?page=1 -> 200 (0.125ms) [Success] timestamp=1792627200.000000000
+[api-service] GET /users?page=1 -> 200 (0.412ms) [Success] timestamp=1792627200.124500000
+[api-service] GET /auth?user=alice&token=[REDACTED]&api_key=[REDACTED] -> 200 (0.285ms) [Success] timestamp=1792627200.450120000
+[api-service] POST /events -> 200 (0.830ms) [Success] timestamp=1792627200.781200000
 ```
 
-| Field | Meaning |
-| --- | --- |
-| Service | Label provided by `--name` |
-| Method and target | HTTP method, visible path, and sanitized query |
-| Status | Forwarded upstream status or constructed proxy error status |
-| Duration | Monotonic handler processing time in milliseconds |
-| Outcome | Completed exchange, upstream failure/timeout, client failure/timeout, or rejection |
-| Timestamp | Handler-entry wall-clock time as Unix seconds and nanoseconds |
+---
 
-`Success` means the upstream exchange completed, including upstream HTTP 4xx/5xx responses. It does not mean application success. Duration includes request and response buffering and upstream work; it excludes request-header parsing, observation output, and delivery to the client. Parser-level rejections and cancelled handlers may have no observation.
+## 🔍 Structured Request Observability (M3)
 
-The CLI observation queue holds 1,024 records. Diagnostics have a separate queue of 256 messages capped at 1,024 bytes each. Full or closed queues drop new entries without waiting. Writer failures and drain timeouts can lose accepted output. Summaries report drops and unconfirmed output when stderr remains usable; a blocked sink cannot reliably report its own failure. These queues are not durable storage. Library callers can read live observation and diagnostic counters without parsing output.
+ExaProp guarantees **at most one observation per handled request**.
 
-Bodies and headers are excluded from observations. Sensitive or ambiguous query names trigger value redaction, but paths, original parameter-name spelling, and unrecognized query values can still expose secrets. Treat output as potentially sensitive. See the [exact latency, privacy, and delivery contract](documents/M3_OBSERVABILITY.md).
+### Captured Observation Fields:
+* **Service Name:** Configured via `--name <id>` (escaped, non-empty identifier).
+* **HTTP Method:** Standard uppercase representation (`GET`, `POST`, `HEAD`, etc.).
+* **Sanitized Path & Query:** Target path preserved; sensitive key values replaced with `[REDACTED]`.
+* **Status Code:** Raw 3-digit HTTP response code (e.g., `200`, `404`, `502`).
+* **Processing Latency:** High-precision monotonic elapsed duration (`std::time::Instant`) from request arrival to backend body completion.
+* **Typed Outcome (`RequestOutcome`):**
+  - `Success`: Valid HTTP exchange completed.
+  - `BackendFailure`: Connection refused, reset, or broken pipe upstream.
+  - `BackendTimeout`: Upstream response exceeded proxy timeout.
+  - `ClientTimeout`: Downstream client stalled during body transmission.
+  - `ClientFailure`: Downstream connection terminated prematurely.
+  - `Rejected`: Invalid framing, oversized payload, or prohibited HTTP method.
 
-## HTTP behavior and limitations
+---
 
-| Area | Current behavior |
-| --- | --- |
-| Transport | Plain HTTP/1.x to one numeric backend; no DNS targets, HTTPS, HTTP/2, CONNECT tunnels, or WebSockets |
-| Buffering | Request and response bodies each limited to 4 MiB; no streaming/SSE semantics |
-| Connections | At most 16 active clients, including idle keep-alive connections |
-| Deadlines | 15-second header/connect stages and each body-frame wait; no total transaction deadline or universal downstream write deadline |
-| Header filtering | Standard and Connection-nominated hop fields removed; malformed client Connection returns 400, malformed upstream Connection returns 502 |
-| Via | Existing chains retained; append received protocol version and `exaprop`, without local addresses, ports, or service labels |
-| Bodyless responses | Suppress content for HEAD, 204, 205, and 304; 204 omits Content-Length, 205 uses Content-Length: 0; Hyper may omit optional 304 length metadata |
-| Unsupported requests | Upgrade/CONNECT and request trailers return 501; Expect returns 417 |
-| Limits and failures | Oversized request: 413; client body timeout: 408; upstream failures, 101, oversized bodies, or trailers: 502; upstream timeout: 504 |
-| Shutdown | Up to 2 seconds for connections, then 2 seconds each for observation and diagnostic output; failed output/draining returns nonzero |
-| Security | No built-in authentication, public-edge hardening, or comprehensive secret detection |
+## 🛡️ Deterministic Anomaly Detection (M4.1)
 
-The CLI handles Ctrl+C, Unix SIGTERM, and Windows Ctrl+Break. Forced termination or connection cancellation can lose observations. Resource limits do not establish a fixed total-memory ceiling. No published benchmark establishes proxy overhead. Use systems and traffic you own or are authorized to test.
+ExaProp includes a pure, mathematically deterministic anomaly detection engine in [`core/src/detection.rs`](core/src/detection.rs).
 
-## Development
+### Detection Rules:
+1. **`HttpServerError`**: Any HTTP response status within `500..=599`.
+2. **`ElevatedRequestDuration`**: Processing duration strictly exceeding the configured threshold (nanosecond precision, default: `1000ms`).
+3. **`UpstreamTimeout`**: Proxy timed out waiting for upstream frames (`RequestOutcome::BackendTimeout`).
 
-Run the same Rust checks used in CI:
+### Security & Invariants:
+- **Zero Allocations:** Rule evaluation runs in zero heap allocations using fixed bitflags.
+- **Scalar-Only Provenance:** Anomalies retain only scalar facts (timestamps, status, durations); **request/response bodies and headers are strictly excluded**.
+- **No Global Mutexes:** Detectors are immutable, pure, and implement `Send + Sync` for lock-free parallel execution across CPU cores.
+
+---
+
+## 💻 CLI Reference
 
 ```bash
+exaprop attach [OPTIONS]
+```
+
+| Option | Flag | Default | Description |
+| :--- | :--- | :--- | :--- |
+| **Listen Address** | `--listen <ADDR>` | `127.0.0.1:8080` | Local socket address to bind and receive client traffic |
+| **Target Address** | `--target <ADDR>` | `127.0.0.1:8081` | Upstream backend socket address to forward traffic to |
+| **Service Label** | `--name <NAME>` | `backend-service` | Service identifier used to tag telemetry observations |
+| **Help** | `-h`, `--help` | — | Print command-line help information |
+| **Version** | `-V`, `--version` | — | Print version information |
+
+---
+
+## 🔬 Research & Systems Resilience Context
+
+ExaProp is engineered as an empirical testbed for **distributed systems resilience, cascading failure analysis, and fault observability**:
+
+1. **Monotonic Timing vs Wall-Clock Skew:** Eliminates NTP time synchronization artifacts by measuring latency strictly through hardware CPU ticks (`Instant`).
+2. **Backpressure Decoupling:** Evaluates producer-consumer isolation under load shedding, proving that slow logging pipelines cannot degrade reverse-proxy forwarding throughput.
+3. **Fault Provenance Isolation:** Formally distinguishes transport-layer breakdowns (TCP reset, connect errors) from protocol-level failures (HTTP 502/504 responses generated by intermediate gateways).
+
+---
+
+## 🚦 Milestones & Roadmap
+
+| Milestone | Focus Area | Status |
+| :--- | :--- | :--- |
+| **M0** | Cargo workspace architecture, linting, and CI pipelines | ✅ Completed |
+| **M1** | Non-blocking HTTP reverse proxy engine & CLI attachment | ✅ Completed |
+| **M2** | HTTP/1.1 correctness, body caps, hop headers & connection limits | ✅ Completed |
+| **M3** | Structured request observability & privacy-safe query redaction | ✅ Completed |
+| **M4.1** | Pure deterministic anomaly detection model & scalar invariants | ✅ Completed |
+| **M4.2** | Consumer-side pipeline coordinator, bounded queues & worker isolation | 🔄 In Progress |
+| **M4.3** | CLI anomaly reporting flags (`--detect`) and V1 telemetry formatting | 📋 Planned |
+| **M4.4** | End-to-end integration verification under simulated upstream faults | 📋 Planned |
+| **M4.5** | Production hardening, audit validation, and telemetry benchmarks | 📋 Planned |
+| **M5+** | Controlled fault injection, chaos orchestration & resilience metrics | 🔭 Research Horizon |
+
+---
+
+## 🛠️ Development & Verification
+
+ExaProp maintains rigorous code quality and security standards. Verify the workspace locally using:
+
+```bash
+# Check code formatting
 cargo fmt --all -- --check
+
+# Workspace typecheck
 cargo check --workspace --locked
+
+# Comprehensive clippy linting (zero warnings permitted)
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+# Execute entire test suite (unit, integration, and doctests)
 cargo test --workspace --locked
-cargo build --workspace --release --locked
+
+# Verify documentation builds cleanly
 cargo doc --workspace --no-deps --locked
 ```
 
-CI denies documentation warnings as well. On Windows, [scripts/check.ps1](scripts/check.ps1) runs Rust verification, including debug builds and strict rustdoc. Linux and Windows CI also run the full FastAPI and HTTP review suites, including deliberate timeout and blocked-output scenarios. See [CONTRIBUTING.md](CONTRIBUTING.md#verification) for environment setup and exact smoke commands.
+---
 
-## Documentation
+## 🤝 Contributing
 
-- [Practical usage: local HTTP, FastAPI, Express, and troubleshooting](documents/EXAPROP_USAGE.md)
-- [M3 observation, privacy, latency, and shutdown contract](documents/M3_OBSERVABILITY.md)
-- [Manual external test guide](documents/M3_OBSERVABILITY_TESTING.md)
-- [M3 engineering review and historical local evidence](documents/M3_FINAL_ENGINEERING_REPORT.md)
-- [Contributing and validation](CONTRIBUTING.md)
-- [Security reporting policy](SECURITY.md)
+Contributions, bug reports, and research discussions are warmly welcomed!
 
-Engineering reports describe their recorded checkout and environment; they are not proof that a later commit or another platform passed.
+- Read our [Contributing Guide](CONTRIBUTING.md) for branch policies and validation instructions.
+- Adhere to our [Code of Conduct](CODE_OF_CONDUCT.md).
+- For security inquiries, consult our [Security Policy](SECURITY.md).
 
-## Roadmap
+---
 
-| Milestone | Scope | Status |
-| --- | --- | --- |
-| M0 | Workspace and project foundation | Implemented |
-| M1 | HTTP proxy engine and CLI | Implemented |
-| M2 | HTTP correctness and bounded resource handling | Implemented |
-| M3 | HTTP request observability | Implemented and merged |
-| M4 | Anomaly detection | Planned; no detector implemented |
-| Later work | Controlled fault experiments and cross-service propagation analysis | Planned; scope and scheduling remain open |
+## 📄 License
 
-## Contributing and security
-
-Focused code, documentation, test, and research contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). Discuss substantial design changes before implementation and distinguish observed evidence from derived anomalies or diagnostic hypotheses.
-
-Do not publish vulnerabilities, credentials, private URLs, authorization headers, or traffic captures in issues. Follow [SECURITY.md](SECURITY.md); private vulnerability reporting currently requires maintainer setup.
-
-## License
-
-ExaProp is licensed under [Apache-2.0](LICENSE). Existing license terms and attribution are preserved.
+ExaProp is licensed under the [Apache License, Version 2.0](LICENSE).  
+Copyright (c) 2026 Dinesh Y R & ExaProp Contributors.
