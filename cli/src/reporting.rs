@@ -572,6 +572,89 @@ pub fn run_writer(
     final_res
 }
 
+/// Supervised telemetry pipeline managing coordinator and writer workers,
+/// bounded channels, and a shared shutdown deadline.
+pub struct TelemetryPipeline {
+    observation_tx: mpsc::Sender<Observation>,
+    stats: Arc<DetectionStats>,
+    coordinator_done_rx: oneshot::Receiver<()>,
+    writer_done_rx: oneshot::Receiver<io::Result<()>>,
+}
+
+impl TelemetryPipeline {
+    /// Spawn dedicated coordinator and writer threads with bounded queues.
+    pub fn spawn<W>(
+        observation_capacity: usize,
+        detector: Detector,
+        writer: W,
+        stats: Arc<DetectionStats>,
+    ) -> io::Result<(Self, mpsc::Sender<Observation>)>
+    where
+        W: Write + Send + 'static,
+    {
+        let (obs_tx, obs_rx) = mpsc::channel(observation_capacity);
+        let (out_tx, out_rx) = mpsc::channel(OUTPUT_BATCH_CAPACITY);
+        let (coord_done_tx, coord_done_rx) = oneshot::channel();
+        let (writer_done_tx, writer_done_rx) = oneshot::channel();
+
+        let coord_stats = Arc::clone(&stats);
+        std::thread::Builder::new()
+            .name("exaprop-coordinator".into())
+            .spawn(move || {
+                run_coordinator(obs_rx, out_tx, detector, coord_stats, Some(coord_done_tx));
+            })?;
+
+        let writer_stats = Arc::clone(&stats);
+        std::thread::Builder::new()
+            .name("exaprop-writer".into())
+            .spawn(move || {
+                let _ = run_writer(out_rx, writer, writer_stats, Some(writer_done_tx));
+            })?;
+
+        let pipeline = Self {
+            observation_tx: obs_tx.clone(),
+            stats,
+            coordinator_done_rx: coord_done_rx,
+            writer_done_rx,
+        };
+
+        Ok((pipeline, obs_tx))
+    }
+
+    /// Supervised shutdown under a single shared telemetry deadline.
+    ///
+    /// Drains the coordinator first, then the writer. If the timeout expires,
+    /// returns `TimedOut` without synchronously blocking Tokio workers on detached threads.
+    pub async fn shutdown(self, timeout: Duration) -> io::Result<DetectionStatsSnapshot> {
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        // Drop the pipeline's own clone so input closes once all external producers drop
+        drop(self.observation_tx);
+
+        // 1. Await coordinator drain within the shared deadline
+        let coord_res = tokio::time::timeout_at(deadline, self.coordinator_done_rx).await;
+        if coord_res.is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Telemetry coordinator did not finish within shutdown timeout",
+            ));
+        }
+
+        // 2. Await writer drain and flush within the remaining shared deadline
+        let writer_res = match tokio::time::timeout_at(deadline, self.writer_done_rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_)) => Err(io::Error::other("Telemetry writer thread panicked")),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Telemetry writer did not finish within shutdown timeout",
+            )),
+        };
+
+        let snapshot = self.stats.snapshot();
+        writer_res.map(|()| snapshot)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,5 +904,95 @@ mod tests {
         assert_eq!(snap.observations_written, 0);
         assert_eq!(snap.events_written, 0);
         assert_eq!(snap.write_errors, 1);
+    }
+
+    #[tokio::test]
+    async fn pipeline_clean_shutdown_drains_all_records() {
+        let config = DetectionConfig::new(500).unwrap();
+        let detector = Detector::new(config);
+        let stats = DetectionStats::new_shared();
+
+        struct SharedBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for SharedBuffer {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let output_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = SharedBuffer(Arc::clone(&output_buf));
+
+        let (pipeline, tx) =
+            TelemetryPipeline::spawn(10, detector, writer, Arc::clone(&stats)).unwrap();
+
+        let obs = Observation::new(
+            UNIX_EPOCH,
+            "orders".into(),
+            Method::POST,
+            "/checkout",
+            StatusCode::OK,
+            Duration::from_millis(50),
+            RequestOutcome::Success,
+        );
+        tx.try_send(obs).unwrap();
+        drop(tx);
+
+        let snap = pipeline.shutdown(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(snap.evaluated, 1);
+        assert_eq!(snap.normal, 1);
+        assert_eq!(snap.batches_queued, 1);
+        assert_eq!(snap.observations_written, 1);
+        assert!(snap.check_settled_invariants().is_ok());
+
+        let output = String::from_utf8(output_buf.lock().unwrap().clone()).unwrap();
+        assert!(output.starts_with("OBSERVATION_V1 seq=1 "));
+        assert!(output.contains("/checkout"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_shutdown_aborts_on_blocked_writer_at_deadline() {
+        let config = DetectionConfig::new(500).unwrap();
+        let detector = Detector::new(config);
+        let stats = DetectionStats::new_shared();
+
+        struct BlockedWriter;
+        impl Write for BlockedWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                // Emulate permanently blocked write (e.g. stalled pipe)
+                std::thread::park();
+                Ok(0)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (pipeline, tx) =
+            TelemetryPipeline::spawn(10, detector, BlockedWriter, Arc::clone(&stats)).unwrap();
+
+        let obs = Observation::new(
+            UNIX_EPOCH,
+            "orders".into(),
+            Method::GET,
+            "/stalled",
+            StatusCode::OK,
+            Duration::from_millis(10),
+            RequestOutcome::Success,
+        );
+        tx.try_send(obs).unwrap();
+        drop(tx);
+
+        let start = std::time::Instant::now();
+        let res = pipeline.shutdown(Duration::from_millis(50)).await;
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        // Shared deadline enforced: aborted around 50ms, did not hang indefinitely
+        assert!(elapsed < Duration::from_millis(500));
     }
 }
