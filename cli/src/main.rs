@@ -1,3 +1,5 @@
+pub mod reporting;
+
 use std::{
     io::{self, Write},
     net::SocketAddr,
