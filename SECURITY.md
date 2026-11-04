@@ -27,4 +27,4 @@ No formal supported-version matrix or security-support lifetime is published. De
 
 Current ExaProp traffic is plain HTTP. The proxy provides no built-in authentication or public-edge hardening. Observation filtering is heuristic: visible paths, query-name spelling, and unrecognized query values can contain secrets. Keep both observations and diagnostics access-controlled and review them before sharing. Bounded queues may drop output and are not an audit log.
 
-Use ExaProp only with systems you own or are authorized to test. Future anomaly detection, fault injection, or traffic manipulation proposals do not change these boundaries. See the [README limitations](README.md#http-behavior-and-limitations) and [observation privacy contract](documents/M3_OBSERVABILITY.md#privacy-policy).
+Use ExaProp only with systems you own or are authorized to test. Anomaly detection and future fault-injection or traffic-manipulation proposals do not change these boundaries. See the [current limitations](documents/EXAPROP_USAGE.md#current-limits) and [observation privacy contract](documents/M3_OBSERVABILITY.md#privacy-policy).

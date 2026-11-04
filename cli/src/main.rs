@@ -13,6 +13,9 @@ use std::{
 use clap::{Parser, Subcommand};
 use tokio::sync::{mpsc, oneshot};
 
+use core_engine::detection::{DetectionConfig, Detector};
+use reporting::{CompletionState, DetectionStats, TelemetryPipeline};
+
 const OBSERVATION_CAPACITY: usize = 1024;
 const OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const DIAGNOSTIC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -72,14 +75,54 @@ enum Command {
         /// Service identifier for observation tagging.
         #[arg(long, default_value = "backend-service")]
         name: String,
+
+        /// Enable deterministic anomaly detection and bounded V1 telemetry output.
+        #[arg(long)]
+        detect: bool,
+
+        /// Duration threshold in milliseconds (requires --detect; default 1000).
+        #[arg(long, requires = "detect", value_parser = clap::value_parser!(u64).range(1..=3_600_000))]
+        latency_threshold_ms: Option<u64>,
     },
 }
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    let result = run().await;
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(error) => {
+            // Clap's default error/exit path writes synchronously. Keep sink I/O
+            // on dedicated threads even before the listener starts.
+            if error.use_stderr() {
+                emit_cli_error(&error.to_string());
+                let _ = core_engine::diagnostics::finish(DIAGNOSTIC_SHUTDOWN_TIMEOUT).await;
+                return std::process::ExitCode::from(2);
+            }
+            return if print_help(error.to_string()).await.is_ok() {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::FAILURE
+            };
+        }
+    };
+    let Command::Attach {
+        detect,
+        latency_threshold_ms,
+        ref name,
+        ..
+    } = args.command;
+    let config = match validate_attach_args(detect, latency_threshold_ms, name) {
+        Ok(config) => config,
+        Err(error) => {
+            emit_cli_error(error);
+            let _ = core_engine::diagnostics::finish(DIAGNOSTIC_SHUTDOWN_TIMEOUT).await;
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let result = run(args.command, config).await;
     if let Err(error) = &result {
-        core_engine::diagnostic!("Error: {error}");
+        let (escaped, _) = reporting::escape_and_bound(&error.to_string(), 900);
+        core_engine::diagnostic!("Error: {escaped}");
     }
     // Returning Result would let Rust's termination handler synchronously write
     // to stderr. Use ExitCode so even an error with a blocked sink can exit.
@@ -91,13 +134,71 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    match Args::parse().command {
+fn emit_cli_error(message: &str) {
+    let (escaped, truncated) = reporting::escape_and_bound(message, 900);
+    core_engine::diagnostic!(
+        "CLI error: {}{}; use exaprop attach --help",
+        escaped,
+        if truncated { " [truncated]" } else { "" }
+    );
+}
+
+async fn print_help(text: String) -> io::Result<()> {
+    let (done_tx, done_rx) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("exaprop-help".into())
+        .spawn(move || {
+            let mut stdout = io::stdout();
+            let result = stdout
+                .write_all(text.as_bytes())
+                .and_then(|()| stdout.flush());
+            let _ = done_tx.send(result);
+        })?;
+    tokio::time::timeout(OUTPUT_SHUTDOWN_TIMEOUT, done_rx)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "help output timed out"))?
+        .map_err(|_| io::Error::other("help output worker failed"))?
+}
+
+fn validate_attach_args(
+    detect: bool,
+    threshold: Option<u64>,
+    name: &str,
+) -> Result<Option<DetectionConfig>, &'static str> {
+    if !detect {
+        return if threshold.is_some() {
+            Err("--latency-threshold-ms requires --detect")
+        } else {
+            Ok(None)
+        };
+    }
+    // Encoded bytes, not character count. Escaping stops at the first overflow.
+    let (_, truncated) = reporting::escape_and_bound(name, reporting::SERVICE_ENCODED_BUDGET);
+    if truncated || name.trim().is_empty() || name.chars().any(char::is_control) {
+        return Err("--detect requires --name to be nonblank, free of controls, and at most 128 escaped bytes; use a nonsecret label");
+    }
+    DetectionConfig::new(threshold.unwrap_or(DetectionConfig::DEFAULT_THRESHOLD_MS))
+        .map(Some)
+        .map_err(|_| "--latency-threshold-ms must be an integer from 1 to 3600000")
+}
+
+async fn run(
+    command: Command,
+    config: Option<DetectionConfig>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
         Command::Attach {
             listen,
             target,
             name,
+            ..
         } => {
+            if !listen.ip().is_loopback() {
+                core_engine::diagnostic!("Warning: non-loopback listener exposes plain HTTP; ExaProp adds no TLS, authentication, or access control");
+            }
+            if let Some(config) = config {
+                return run_detection(listen, target, name, config).await;
+            }
             let (tx, rx) = mpsc::channel(OBSERVATION_CAPACITY);
             let (done_tx, done_rx) = oneshot::channel();
             let stats = core_engine::ObservationStats::default();
@@ -149,10 +250,248 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn run_detection(
+    listen: SocketAddr,
+    target: SocketAddr,
+    name: String,
+    config: DetectionConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input = core_engine::ObservationStats::default();
+    let stats = DetectionStats::new_shared();
+    // Retain stats independently: shutdown consumes the pipeline even on failure.
+    let (pipeline, tx) = TelemetryPipeline::spawn(
+        OBSERVATION_CAPACITY,
+        Detector::new(config),
+        io::stdout(),
+        Arc::clone(&stats),
+    )?;
+    // Move the only external sender into the proxy. Its handlers release their
+    // clones before this future completes, including after a listener bind error.
+    let proxy_result = core_engine::proxy::run_with_observer_and_stats(
+        listen,
+        target,
+        name,
+        Some(tx),
+        input.clone(),
+    )
+    .await;
+    let output_result = finish_detection(
+        pipeline,
+        &stats,
+        &input,
+        reporting::TELEMETRY_SHUTDOWN_TIMEOUT,
+    )
+    .await;
+    // Complete teardown and summaries even when proxy startup or shutdown failed.
+    proxy_result?;
+    output_result?;
+    Ok(())
+}
+
+async fn finish_detection(
+    pipeline: TelemetryPipeline,
+    stats: &DetectionStats,
+    input: &core_engine::ObservationStats,
+    timeout: Duration,
+) -> io::Result<()> {
+    let result = pipeline.shutdown(timeout).await;
+    let input = input.snapshot();
+    let (snapshot, result) = match result {
+        Ok(snapshot) => {
+            let result =
+                reporting::check_detection_settled(&snapshot, input).map_err(io::Error::other);
+            (snapshot, result)
+        }
+        Err(error) => (stats.snapshot(), Err(error)),
+    };
+    let state = CompletionState::from_result(&result);
+    let detection = reporting::format_detection_stats_diagnostic(&snapshot)
+        .map_err(|_| io::Error::other("detection summary exceeded byte budget"))?;
+    let output = reporting::format_anomaly_output_diagnostic(&snapshot, input, state)
+        .map_err(|_| io::Error::other("output summary exceeded byte budget"))?;
+    core_engine::diagnostic!("{detection}");
+    core_engine::diagnostic!("{output}");
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+
+    #[test]
+    fn detection_flags_validate_defaults_boundaries_and_dependency() {
+        for threshold in [1, 1000, 3_600_000] {
+            let value = threshold.to_string();
+            let args = Args::try_parse_from([
+                "exaprop",
+                "attach",
+                "--detect",
+                "--latency-threshold-ms",
+                &value,
+            ])
+            .unwrap();
+            let Command::Attach {
+                detect,
+                latency_threshold_ms,
+                name,
+                ..
+            } = args.command;
+            let config = validate_attach_args(detect, latency_threshold_ms, &name)
+                .unwrap()
+                .unwrap();
+            assert_eq!(config.latency_threshold(), Duration::from_millis(threshold));
+        }
+        assert_eq!(
+            validate_attach_args(true, None, "orders").unwrap().unwrap(),
+            DetectionConfig::default()
+        );
+        assert_eq!(validate_attach_args(false, None, "").unwrap(), None);
+        assert!(validate_attach_args(false, Some(1), "orders").is_err());
+        for value in ["0", "3600001", "-1", "1.5", "18446744073709551616", "text"] {
+            let error = Args::try_parse_from([
+                "exaprop",
+                "attach",
+                "--detect",
+                "--latency-threshold-ms",
+                value,
+            ])
+            .unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+        }
+        for flags in [
+            vec!["--latency-threshold-ms", "500"],
+            vec![
+                "--detect",
+                "--latency-threshold-ms",
+                "500",
+                "--latency-threshold-ms",
+                "600",
+            ],
+            vec!["--detect", "--detect"],
+        ] {
+            assert_eq!(
+                Args::try_parse_from(["exaprop", "attach"].into_iter().chain(flags))
+                    .unwrap_err()
+                    .exit_code(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn service_policy_applies_only_to_detection_and_uses_encoded_bytes() {
+        for name in [
+            "",
+            "  ",
+            "bad\nname",
+            "bad\x1bname",
+            &"a".repeat(129),
+            &"🦀".repeat(9),
+        ] {
+            assert!(validate_attach_args(true, None, name).is_err());
+            assert!(validate_attach_args(false, None, name).unwrap().is_none());
+        }
+        for name in ["orders", &"a".repeat(128), &"🦀".repeat(8)] {
+            assert!(validate_attach_args(true, None, name).is_ok());
+        }
+        for threshold in [0, 3_600_001, u64::MAX] {
+            assert!(validate_attach_args(true, Some(threshold), "orders").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_pipeline_retains_counters_and_returns_failure() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let stats = DetectionStats::new_shared();
+        let (pipeline, tx) = TelemetryPipeline::spawn(
+            1,
+            Detector::new(DetectionConfig::default()),
+            Broken,
+            Arc::clone(&stats),
+        )
+        .unwrap();
+        tx.try_send(core_engine::Observation::new(
+            UNIX_EPOCH,
+            "orders".into(),
+            core_engine::Method::GET,
+            "/",
+            core_engine::StatusCode::INTERNAL_SERVER_ERROR,
+            Duration::ZERO,
+            core_engine::RequestOutcome::Success,
+        ))
+        .unwrap();
+        drop(tx);
+        let result = finish_detection(
+            pipeline,
+            &stats,
+            &core_engine::ObservationStats::default(),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(
+            CompletionState::from_result(&result),
+            CompletionState::Failed
+        );
+        assert_eq!(stats.snapshot().anomalous, 1);
+        assert_eq!(stats.snapshot().write_errors, 1);
+        assert_eq!(stats.snapshot().events_unconfirmed(), 1);
+    }
+
+    #[tokio::test]
+    async fn invariant_failure_returns_error_and_live_producer_times_out() {
+        let input = core_engine::ObservationStats::default();
+        let stats = DetectionStats::new_shared();
+        let (pipeline, tx) = TelemetryPipeline::spawn(
+            1,
+            Detector::new(DetectionConfig::default()),
+            io::sink(),
+            Arc::clone(&stats),
+        )
+        .unwrap();
+        tx.try_send(core_engine::Observation::new(
+            UNIX_EPOCH,
+            "orders".into(),
+            core_engine::Method::GET,
+            "/",
+            core_engine::StatusCode::OK,
+            Duration::ZERO,
+            core_engine::RequestOutcome::Success,
+        ))
+        .unwrap();
+        drop(tx);
+        // Synthetic sends bypass proxy input accounting: successful workers must
+        // still fail settlement rather than panic or report clean coverage.
+        let result = finish_detection(pipeline, &stats, &input, Duration::from_secs(2)).await;
+        assert_eq!(
+            CompletionState::from_result(&result),
+            CompletionState::Failed
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("input enqueued != evaluated"));
+        let (pipeline, tx) = TelemetryPipeline::spawn(
+            1,
+            Detector::new(DetectionConfig::default()),
+            io::sink(),
+            Arc::clone(&stats),
+        )
+        .unwrap();
+        let result = finish_detection(pipeline, &stats, &input, Duration::from_millis(10)).await;
+        assert_eq!(
+            CompletionState::from_result(&result),
+            CompletionState::TimedOut
+        );
+        drop(tx); // release the deliberate retained producer so workers can exit
+    }
 
     #[test]
     fn parses_service_name_and_default_addresses() {
@@ -161,6 +500,7 @@ mod tests {
             listen,
             target,
             name,
+            ..
         } = args.command;
         assert_eq!(listen.to_string(), "127.0.0.1:8080");
         assert_eq!(target.to_string(), "127.0.0.1:8081");

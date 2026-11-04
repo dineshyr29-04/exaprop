@@ -118,7 +118,8 @@ impl DetectionStats {
         }
     }
 
-    /// Capture a point-in-time snapshot of all counters.
+    /// Independently read counters. Concurrent snapshots are not transactions;
+    /// use settled identities only after successful worker completion.
     pub fn snapshot(&self) -> DetectionStatsSnapshot {
         DetectionStatsSnapshot {
             evaluated: self.evaluated.load(Ordering::Relaxed),
@@ -164,7 +165,9 @@ pub struct DetectionStatsSnapshot {
     pub events_queued: u64,
     pub events_dropped_full: u64,
     pub events_dropped_closed: u64,
+    /// Complete successful write_all operations, not flushed or durable delivery.
     pub observations_written: u64,
+    /// Complete successful write_all operations, not flushed or durable delivery.
     pub events_written: u64,
     pub write_errors: u64,
     pub truncated_observations: u64,
@@ -240,24 +243,111 @@ impl DetectionStatsSnapshot {
     }
 }
 
+/// Telemetry completion state; independent of proxy or diagnostic-sink success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionState {
+    Clean,
+    Failed,
+    TimedOut,
+}
+
+impl CompletionState {
+    pub fn from_result(result: &io::Result<()>) -> Self {
+        match result {
+            Ok(()) => Self::Clean,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => Self::TimedOut,
+            Err(_) => Self::Failed,
+        }
+    }
+
+    fn token(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Strong identities apply only after successful coordinator AND writer completion.
+/// Queue-full loss alone is permitted. Saturated counters cannot prove identities.
+pub fn check_detection_settled(
+    snapshot: &DetectionStatsSnapshot,
+    input: core_engine::ObservationStatsSnapshot,
+) -> Result<(), &'static str> {
+    snapshot.check_settled_invariants()?;
+    if snapshot.counters_saturated {
+        return Ok(());
+    }
+    if input.enqueued != snapshot.evaluated {
+        return Err("input enqueued != evaluated");
+    }
+    if u128::from(snapshot.evaluated)
+        != u128::from(snapshot.batches_queued)
+            + u128::from(snapshot.observations_output_dropped_full)
+            + u128::from(snapshot.observations_output_dropped_closed)
+    {
+        return Err("evaluated != queued + output drops");
+    }
+    if snapshot.observations_written != snapshot.batches_queued
+        || snapshot.events_written != snapshot.events_queued
+    {
+        return Err("successful drain left accepted output unconfirmed");
+    }
+    Ok(())
+}
+
+// The diagnostic writer appends its own newline. Reserve that byte here.
+fn diagnostic_line(args: std::fmt::Arguments<'_>) -> Result<String, RenderLimit> {
+    let line = bounded_line(1023, args)?;
+    String::from_utf8(line.into_vec()).map_err(|_| RenderLimit)
+}
+
+/// Fixed scalar-only summary; no newline, no arbitrary request data.
+pub fn format_detection_stats_diagnostic(
+    s: &DetectionStatsSnapshot,
+) -> Result<String, RenderLimit> {
+    diagnostic_line(format_args!(
+        "detection_stats evaluated={} normal={} anomalous={} http_5xx={} duration={} timeout={} batches_queued={} events_queued={} drops_obs_full={} drops_obs_closed={} drops_events_full={} drops_events_closed={} truncated_obs={} truncated_events={} saturated={}",
+        s.evaluated, s.normal, s.anomalous, s.matches_http_server_error,
+        s.matches_elevated_request_duration, s.matches_upstream_timeout,
+        s.batches_queued, s.events_queued, s.observations_output_dropped_full,
+        s.observations_output_dropped_closed, s.events_dropped_full, s.events_dropped_closed,
+        s.truncated_observations, s.truncated_events, s.counters_saturated,
+    ))
+}
+
+/// Floored unconfirmed counts are incomplete on failure/timeout and may change later.
+/// Input-unconfirmed includes unevaluated records AND downstream output loss;
+/// output-unconfirmed counts accepted batches/events whose line writes are unconfirmed.
+pub fn format_anomaly_output_diagnostic(
+    s: &DetectionStatsSnapshot,
+    input: core_engine::ObservationStatsSnapshot,
+    state: CompletionState,
+) -> Result<String, RenderLimit> {
+    diagnostic_line(format_args!(
+        "anomaly_output written_obs={} written_events={} output_unconfirmed_obs={} output_unconfirmed_events={} write_errors={} input_enqueued={} input_dropped_full={} input_dropped_closed={} input_unevaluated={} input_unconfirmed={} state={}",
+        s.observations_written, s.events_written, s.observations_unconfirmed(),
+        s.events_unconfirmed(), s.write_errors, input.enqueued, input.dropped_full,
+        input.dropped_closed, input.enqueued.saturating_sub(s.evaluated),
+        input.enqueued.saturating_sub(s.observations_written), state.token(),
+    ))
+}
+
 /// Format timestamp as signed Unix seconds with 9 decimal places (nanoseconds).
 pub fn format_timestamp(ts: SystemTime) -> String {
     match ts.duration_since(UNIX_EPOCH) {
         Ok(dur) => format!("{}.{:09}", dur.as_secs(), dur.subsec_nanos()),
         Err(err) => {
             let dur = err.duration();
-            let secs = dur.as_secs();
-            let nanos = dur.subsec_nanos();
-            if nanos == 0 {
-                format!("-{secs}.000000000")
-            } else {
-                format!("-{}.{:09}", secs + 1, 1_000_000_000 - nanos)
-            }
+            // A signed decimal applies the minus sign to the entire magnitude,
+            // e.g. one nanosecond before the epoch is -0.000000001.
+            format!("-{}.{:09}", dur.as_secs(), dur.subsec_nanos())
         }
     }
 }
 
-/// Format duration in milliseconds with 6 decimal places (microsecond resolution).
+/// Format integer-derived milliseconds with 6 decimal places (nanosecond resolution).
 pub fn format_duration_ms(dur: Duration) -> String {
     let total_ms = dur.as_millis();
     let micros_frac = (dur.subsec_nanos() % 1_000_000) / 1000;
@@ -896,6 +986,105 @@ mod tests {
     };
 
     #[test]
+    fn timestamps_preserve_signed_decimal_values_around_the_epoch() {
+        for (duration, expected) in [
+            // Windows SystemTime uses 100 ns ticks; use representable values
+            // here while Duration-based detector tests keep 1 ns boundaries.
+            (Duration::from_nanos(100), "-0.000000100"),
+            (Duration::from_millis(500), "-0.500000000"),
+            (Duration::from_secs(1), "-1.000000000"),
+            (Duration::from_millis(1500), "-1.500000000"),
+        ] {
+            assert_eq!(format_timestamp(UNIX_EPOCH - duration), expected);
+        }
+        assert_eq!(format_timestamp(UNIX_EPOCH), "0.000000000");
+        assert_eq!(
+            format_timestamp(UNIX_EPOCH + Duration::from_nanos(100)),
+            "0.000000100"
+        );
+    }
+
+    #[test]
+    fn diagnostic_summaries_fit_with_maximum_counters_and_every_state() {
+        let s = DetectionStatsSnapshot {
+            evaluated: u64::MAX,
+            normal: u64::MAX,
+            anomalous: u64::MAX,
+            matches_http_server_error: u64::MAX,
+            matches_elevated_request_duration: u64::MAX,
+            matches_upstream_timeout: u64::MAX,
+            batches_queued: u64::MAX,
+            observations_output_dropped_full: u64::MAX,
+            observations_output_dropped_closed: u64::MAX,
+            events_queued: u64::MAX,
+            events_dropped_full: u64::MAX,
+            events_dropped_closed: u64::MAX,
+            observations_written: 0,
+            events_written: 0,
+            write_errors: u64::MAX,
+            truncated_observations: u64::MAX,
+            truncated_events: u64::MAX,
+            counters_saturated: true,
+        };
+        let input = core_engine::ObservationStatsSnapshot {
+            enqueued: u64::MAX,
+            dropped_full: u64::MAX,
+            dropped_closed: u64::MAX,
+        };
+        let detection = format_detection_stats_diagnostic(&s).unwrap();
+        assert!(detection.len() < 1024);
+        assert!(!detection.contains('\n'));
+        assert!(detection.ends_with("saturated=true"));
+        for state in [
+            CompletionState::Clean,
+            CompletionState::Failed,
+            CompletionState::TimedOut,
+        ] {
+            let output = format_anomaly_output_diagnostic(&s, input, state).unwrap();
+            assert!(output.len() < 1024);
+            assert!(!output.contains('\n'));
+            assert!(output.ends_with(state.token()));
+            assert!(output.contains("output_unconfirmed_events=18446744073709551615"));
+        }
+        assert_eq!(
+            CompletionState::from_result(&Err(io::ErrorKind::TimedOut.into())),
+            CompletionState::TimedOut
+        );
+        assert_eq!(
+            CompletionState::from_result(&Err(io::ErrorKind::BrokenPipe.into())),
+            CompletionState::Failed
+        );
+    }
+
+    #[test]
+    fn successful_drain_checks_input_coverage_output_losses_and_write_completion() {
+        let mut s = DetectionStatsSnapshot {
+            evaluated: 2,
+            normal: 2,
+            batches_queued: 1,
+            observations_output_dropped_full: 1,
+            observations_written: 1,
+            ..Default::default()
+        };
+        let mut input = core_engine::ObservationStatsSnapshot {
+            enqueued: 2,
+            dropped_full: 3,
+            dropped_closed: 0,
+        };
+        assert!(check_detection_settled(&s, input).is_ok()); // full queues alone are not failure
+        input.enqueued = 3;
+        assert!(check_detection_settled(&s, input).is_err());
+        input.enqueued = 2;
+        s.observations_written = 0;
+        assert!(check_detection_settled(&s, input).is_err());
+        s.observations_written = 1;
+        s.observations_output_dropped_full = 0;
+        assert!(check_detection_settled(&s, input).is_err());
+        s.counters_saturated = true;
+        assert!(check_detection_settled(&s, input).is_ok()); // arithmetic evidence unavailable
+    }
+
+    #[test]
     fn bounded_construction_rejects_overflow_in_all_profiles() {
         use std::fmt::Write;
         let mut line = BoundedLine {
@@ -1506,6 +1695,53 @@ mod tests {
         assert!(line.ends_with(b"\n"));
         let line_str = std::str::from_utf8(&line).unwrap();
         assert!(line_str.contains("truncated_fields=path"));
+    }
+
+    #[test]
+    fn anomaly_labels_cannot_inject_records_and_methods_keep_valid_token_punctuation() {
+        // A synthetic producer can bypass CLI name validation. Renderers must
+        // still isolate quoted labels without admitting request URL metadata.
+        let method = Method::from_bytes(b"X!#$%&'*+-.^_`|~").unwrap();
+        let mut obs = Observation::new(
+            UNIX_EPOCH,
+            "svc\"\nANOMALY_V1 seq=999\x1b[2J\\🦀".into(),
+            method.clone(),
+            "/REQUEST_PATH_SENTINEL",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Duration::ZERO,
+            RequestOutcome::Success,
+        );
+        obs.query = Some("PRIVATE_QUERY_SENTINEL=secret".into());
+        let anomaly = Detector::new(DetectionConfig::default())
+            .evaluate(&obs)
+            .unwrap();
+        let (line, truncated) =
+            render_anomaly_line(7, &obs.service_name, &method, &anomaly).unwrap();
+        assert!(!truncated);
+        assert!(line.len() <= ANOMALY_LINE_CAP);
+        assert!(line
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\n'));
+        let line = std::str::from_utf8(&line).unwrap();
+        assert_eq!(line.matches('\n').count(), 1);
+        assert!(line.starts_with("ANOMALY_V1 seq=7 timestamp=0.000000000 "));
+        assert!(line.contains(r#"service="svc\"\nANOMALY_V1 seq=999\x1b[2J\\\xf0\x9f\xa6\x80""#));
+        assert!(line.contains("method=\"X!#$%&'*+-.^_`|~\" status=500"));
+        assert!(!line.contains("REQUEST_PATH_SENTINEL"));
+        assert!(!line.contains("PRIVATE_QUERY_SENTINEL"));
+        assert!(line.ends_with("threshold_ms=none truncated_fields=none\n"));
+        // Controls, separators and Unicode cannot form a supported Method.
+        // Do not invent impossible Method values to claim escaping coverage.
+        for invalid in [
+            b"GET\n".as_slice(),
+            b"GET\x1b[2J",
+            b"GET\"",
+            b"GET\\",
+            b"GET BAD",
+            "🦀".as_bytes(),
+        ] {
+            assert!(Method::from_bytes(invalid).is_err());
+        }
     }
 
     #[test]

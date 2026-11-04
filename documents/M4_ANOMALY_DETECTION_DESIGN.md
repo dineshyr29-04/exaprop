@@ -1,10 +1,14 @@
 # M4 — Deterministic HTTP anomaly detection
 
-Status: **M4.1 pure detection model and M4.2 pipeline integration implemented; M4.2 remains CLI-inactive until M4.3; M4.3–M4.5 remain unimplemented and are not authorized by this document**.
+Status: **M4.1 pure model, M4.2 pipeline and M4.3 opt-in CLI integration implemented on the M4.3 working branch; M4.4–M4.5 remain unimplemented**. Working-tree validation is distinct from hosted CI or merge approval.
+
+Repository baseline review (4 November 2026): M4.2 is merged into `main` by PR #4, commit `c3c0ffee003200a07dbda65fb250ddcc3e4b9a04`. The M4.3 branch incorporates that main commit without rewriting its existing feature commits. M4.3 remains separate from main pending its own verification/review and merge decision. The original design baseline below is retained as historical context.
 
 Design date: 23 October 2026 (Asia/Calcutta). Source baseline: `origin/main` at `6c862edb86e88abd9ef1d6ede80d14a6821743d8`. Design branch: `m4-anomaly-detection`. Both the M3 merge and repository-standards merge are ancestors of this baseline. The original design-only change added this document without runtime code. M4.1 was subsequently authorized separately and implemented in `core/src/detection.rs`, with its module export in `core/src/lib.rs`, through commit `8cb673a584431f79527e80ca089c2ad048c2b1e0`. M4.2 was implemented in `cli/src/reporting.rs` under feature branch `m4-pipeline`.
 
-Implementation-status review: 3 November 2026. M4.1 includes immutable validated configuration, pure rule evaluation, scalar-only anomaly evidence, and deterministic model tests. M4.2 implements the consumer-side telemetry pipeline (`OutputBatch`, `DetectionStats` race-safe saturating atomic counters, non-blocking `run_coordinator` with sequence overflow prevention, `run_writer` with complete-line accounting, and `TelemetryPipeline` single-deadline supervision). M4.2 remains internal and CLI-inactive until M4.3 wires public CLI flags and presentation. Those subsequent parts of the design below remain proposals for later phases. Verification results must identify their exact commit and environment; implementation status alone is not a security or merge-readiness guarantee.
+Implementation-status review: 4 November 2026. M4.1 includes immutable validated configuration, pure rule evaluation, scalar-only anomaly evidence, and deterministic model tests. M4.2 implements the consumer-side telemetry pipeline (`OutputBatch`, saturating `DetectionStats`, nonblocking `run_coordinator`, complete-line `run_writer`, and single-deadline `TelemetryPipeline` supervision). M4.3 integrates `--detect` and `--latency-threshold-ms`, validated configuration, bounded diagnostic summaries, explicit completion states and CLI acceptance coverage. Subsequent milestones remain proposals. Verification results must identify their exact commit or working tree and environment; implementation status alone is not a security or merge-readiness guarantee.
+
+M4.3 review decisions: preserve legacy service-name acceptance when detection is off; with detection on, require a nonblank, control-free name fitting 128 escaped bytes. This validates a display label, not whether it contains secrets. Argument validation precedes listener/telemetry startup; failed validation may start only the bounded diagnostic writer. Help/version use a separate stdout thread and bounded wait. Diagnostic summary content reserves its final newline (at most 1,023 content bytes). Retain an independent stats handle for failure snapshots, and distinguish clean/failed/timed-out telemetry completion. Applicable settled-invariant failures return errors rather than panic. New CLI tests run alongside unchanged M3 suites; broader M4.4 integration verification remains separate.
 
 ## 1. Executive summary
 
@@ -120,7 +124,7 @@ An identical observation evaluated twice yields the same classification twice. T
 
 ### 7.2 Proposed public core API
 
-M4.1 implements the small `core_engine::detection` module in [detection.rs](../core/src/detection.rs), exported through [lib.rs](../core/src/lib.rs). The following contracts describe that pure model; pipeline and presentation behavior elsewhere in this document remains unimplemented:
+M4.1 implements the small `core_engine::detection` module in [detection.rs](../core/src/detection.rs), exported through [lib.rs](../core/src/lib.rs). The following contracts describe that pure model; the CLI pipeline and presentation are implemented separately in M4.2–M4.3:
 
 | Type / operation | Proposed contract |
 | --- | --- |
@@ -199,7 +203,7 @@ One try-send accepts or drops the entire batch. Anomalies do not obtain extra qu
 
 ## 10. Configuration and CLI contract
 
-The following flags are proposals; they do not exist in the current CLI:
+The following flags are implemented on the M4.3 branch:
 
 ```text
 exaprop attach --name orders --detect
@@ -213,7 +217,7 @@ exaprop attach --name orders --detect --latency-threshold-ms 750
 | Threshold supplied without `--detect` | CLI validation error, exit 2, before binding listener or starting workers |
 | Zero, negative, fractional, overflow, nonnumeric, or above-range threshold | Error, exit 2; no silent clamping, default fallback, or disabled-rule interpretation |
 | Per-rule disablement | Not provided in initial M4; zero does not disable duration detection |
-| `--name` | Existing default/service semantics retained; same bounded escaped label on derived output |
+| `--name` | Existing default retained; detection mode requires a nonblank, control-free name within 128 escaped bytes; detection-off acceptance is unchanged |
 | Output selection | No `--anomaly-output` flag initially; stdout carries tagged observations and anomalies, stderr carries operational messages and summaries |
 
 Prefer these two flags over an output destination option: arbitrary file sinks add lifecycle and security decisions without a demonstrated initial need. Shell redirection applies to the combined stdout stream. A closed/blocked stdout sink never triggers fallback to stderr and never disables detection silently. No config file, environment framework, database, or remote management is proposed.
