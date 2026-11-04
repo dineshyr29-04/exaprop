@@ -86,6 +86,8 @@ Two best-effort stderr summaries describe completion:
 
 `state=clean` means both telemetry workers completed, the final flush succeeded and applicable settled identities passed. It does not mean that no queue drops occurred, that the proxy started successfully, or that diagnostics were delivered. “Written” means a complete successful `write_all`, not flushed or durable storage. Summaries may be dropped if stderr is full/closed.
 
+For example, if the requested listen port is already occupied, the proxy fails to bind and exits with code 1. Its empty telemetry pipeline can still finish successfully and report `anomaly_output ... state=clean`. This describes telemetry completion; use the process exit code and bounded error diagnostic to determine whether proxy execution succeeded.
+
 Exit 0 indicates successful proxy/telemetry/diagnostics completion. Runtime failures, invariant failures, broken output or drain timeouts produce exit 1; queue-full drops alone do not. Usage errors return 2 through bounded, escaped diagnostics and no proxy startup. Help/version use stdout with a bounded completion wait. Selecting a non-loopback listener emits a warning: ExaProp supplies no TLS, authentication or access control.
 
 ### Backend language compatibility

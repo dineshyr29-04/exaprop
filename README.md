@@ -202,7 +202,7 @@ ExaProp is engineered as an empirical testbed for **distributed systems resilien
 | **M3** | Structured request observability & privacy-safe query redaction | Completed |
 | **M4.1** | Pure deterministic anomaly detection model & scalar invariants | Completed |
 | **M4.2** | Consumer-side pipeline coordinator, bounded queues & worker isolation | Merged into main in [PR #4](https://github.com/dineshyr29-04/exaprop/pull/4) |
-| **M4.3** | CLI anomaly reporting flags (`--detect`) and V1 telemetry formatting | Implemented on integration branch; hosted verification pending |
+| **M4.3** | CLI anomaly reporting flags (`--detect`) and V1 telemetry formatting | Implemented on integration branch; pending merge review |
 | **M4.4** | End-to-end integration verification under simulated upstream faults | Planned |
 | **M4.5** | Production hardening, audit validation, and telemetry benchmarks | Planned |
 | **M5+** | Controlled fault injection, chaos orchestration & resilience metrics | Research Horizon |

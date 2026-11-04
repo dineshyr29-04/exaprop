@@ -1698,6 +1698,53 @@ mod tests {
     }
 
     #[test]
+    fn anomaly_labels_cannot_inject_records_and_methods_keep_valid_token_punctuation() {
+        // A synthetic producer can bypass CLI name validation. Renderers must
+        // still isolate quoted labels without admitting request URL metadata.
+        let method = Method::from_bytes(b"X!#$%&'*+-.^_`|~").unwrap();
+        let mut obs = Observation::new(
+            UNIX_EPOCH,
+            "svc\"\nANOMALY_V1 seq=999\x1b[2J\\🦀".into(),
+            method.clone(),
+            "/REQUEST_PATH_SENTINEL",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Duration::ZERO,
+            RequestOutcome::Success,
+        );
+        obs.query = Some("PRIVATE_QUERY_SENTINEL=secret".into());
+        let anomaly = Detector::new(DetectionConfig::default())
+            .evaluate(&obs)
+            .unwrap();
+        let (line, truncated) =
+            render_anomaly_line(7, &obs.service_name, &method, &anomaly).unwrap();
+        assert!(!truncated);
+        assert!(line.len() <= ANOMALY_LINE_CAP);
+        assert!(line
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\n'));
+        let line = std::str::from_utf8(&line).unwrap();
+        assert_eq!(line.matches('\n').count(), 1);
+        assert!(line.starts_with("ANOMALY_V1 seq=7 timestamp=0.000000000 "));
+        assert!(line.contains(r#"service="svc\"\nANOMALY_V1 seq=999\x1b[2J\\\xf0\x9f\xa6\x80""#));
+        assert!(line.contains("method=\"X!#$%&'*+-.^_`|~\" status=500"));
+        assert!(!line.contains("REQUEST_PATH_SENTINEL"));
+        assert!(!line.contains("PRIVATE_QUERY_SENTINEL"));
+        assert!(line.ends_with("threshold_ms=none truncated_fields=none\n"));
+        // Controls, separators and Unicode cannot form a supported Method.
+        // Do not invent impossible Method values to claim escaping coverage.
+        for invalid in [
+            b"GET\n".as_slice(),
+            b"GET\x1b[2J",
+            b"GET\"",
+            b"GET\\",
+            b"GET BAD",
+            "🦀".as_bytes(),
+        ] {
+            assert!(Method::from_bytes(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn anomaly_line_contains_zero_url_or_header_payloads() {
         let (obs_tx, obs_rx) = mpsc::channel(10);
         let (out_tx, mut out_rx) = mpsc::channel(10);
