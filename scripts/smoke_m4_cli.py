@@ -105,10 +105,16 @@ def summary(path, prefix):
 
 def start(binary, backend_port, stdout, stderr, extra=()):
     port = available_port()
+    options = windows_options()
+    if sys.platform == 'linux' and (stdout == subprocess.PIPE or stderr == subprocess.PIPE):
+        # Hosted Linux pipes can absorb the entire diagnostic workload without
+        # blocking, unlike Windows' smaller pipes. Make sink pressure explicit
+        # so an unread pipe really blocks; keep all request/exit assertions.
+        options['pipesize'] = 4096
     process = subprocess.Popen(
         [str(binary), 'attach', '--listen', f'127.0.0.1:{port}', '--target', f'127.0.0.1:{backend_port}',
          '--name', 'cli-review', '--detect', *extra],
-        cwd=ROOT, stdout=stdout, stderr=stderr, **windows_options(),
+        cwd=ROOT, stdout=stdout, stderr=stderr, **options,
     )
     return process, port
 
