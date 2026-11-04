@@ -3,9 +3,10 @@
 ## Document Metadata
 - **Milestone:** M4.3 (CLI Integration and Anomaly Presentation)
 - **Target Repository:** `exaprop` (Rust Workspace)
-- **Status:** Proposed Implementation Specification (Reviewed & Hardened)
+- **Status:** Implemented on `m4-cli-integration`; local and hosted validation must be reported separately
 - **Author:** Lead Systems & Reverse-Proxy Architect
 - **Baseline Commit:** `1803dd539b73b05782d67546e0691b34f7bcd543` (`m4-pipeline`)
+- **Merged M4.2 Baseline:** `c3c0ffee003200a07dbda65fb250ddcc3e4b9a04` on `main` (PR #4); incorporated without rewriting published M4.3 commits
 - **Target Delivery Branch:** `m4-cli-integration`
 
 ---
@@ -51,7 +52,7 @@ exaprop attach \
 
 ### 2.3 Strict Pre-Flight Validation Rules
 
-Validation occurs immediately upon CLI parsing **before** any network sockets are bound or background workers are spawned. Any violation immediately aborts execution with exit code `2` (`EX_USAGE`) and emits a clear, actionable error message to `stderr`:
+Validation occurs immediately upon CLI parsing **before** a proxy listener or telemetry workers start. A validation error returns Clap-compatible usage exit code `2`, using escaped, bounded diagnostics with their own completion wait. Error reporting may start the diagnostic writer; help/version use a dedicated stdout thread with a bounded wait. There are no direct synchronous error writes on the async caller. The messages below describe required meaning; exact Clap wording may differ.
 
 ```
 Validation Rules:
@@ -75,7 +76,7 @@ Validation Rules:
 
 - Preserve the current loopback listen default. When the user explicitly selects a non-loopback listener, emit a clear bounded warning: ExaProp does not automatically add TLS, authentication, or access control. Do not silently change the bind address.
 - Define and test duplicate-flag behavior using Clap (prefer rejection for duplicate `--latency-threshold-ms`); avoid ambiguous last-value-wins behavior.
-- Validate `--name` as a nonempty, bounded service identifier before spawning workers. Choose and document an explicit encoded-byte length policy (max 128 bytes). Reject control characters and newlines in names by policy; **never claim validation can reliably detect every secret**.
+- With detection enabled, require `--name` to be nonblank, control-free and at most 128 escaped bytes (not raw bytes or Unicode characters). Preserve legacy name acceptance when detection is off. **Never claim validation can reliably detect every secret**.
 - Preserve the existing `--target` socket-address contract rather than introducing URL parsing without a separate design decision.
 - Validate before binding sockets or spawning telemetry workers. Keep diagnostics free of unescaped user-provided arguments.
 - Ensure both M3 and detection-mode output remain appropriately access-controlled; the legacy path may expose raw request metadata.
@@ -135,7 +136,7 @@ Validation Rules:
    - Executes nonblocking HTTP reverse proxy forwarding (`hyper`).
    - Produces `Observation` values on request completion.
    - Enqueues via `mpsc::Sender::try_send`.
-   - **Guaranteed Invariant:** An overloaded, stalled, or broken telemetry subsystem drops observation records at the queue boundary without introducing latency or backpressure to HTTP requests.
+   - **Guaranteed Invariant:** HTTP handlers never wait for telemetry queue capacity or output I/O. Full or closed queues drop records. CPU, allocation and shared scheduling costs remain; no zero-latency or throughput guarantee is implied.
 
 2. **Coordinator Worker (`Dedicated OS Thread`)**:
    - Owns the `mpsc::Receiver<Observation>`.
@@ -148,7 +149,7 @@ Validation Rules:
 3. **Writer Worker (`Dedicated OS Thread`)**:
    - Owns the `mpsc::Receiver<OutputBatch>`.
    - Writes complete pre-rendered byte lines to `io::stdout()` using `write_all`.
-   - Flushes output upon stream closure or termination.
+   - Flushes after clean stream closure; a write error is returned without a further blocking flush attempt.
    - Increments line completion counters only upon complete, error-free writes.
 
 ---
@@ -163,13 +164,13 @@ When `--detect` is active, ExaProp outputs structured, deterministic, machine-re
 - **Prefix:** `OBSERVATION_V1 `
 - **Grammar:**
 ```text
-OBSERVATION_V1 seq=<U64> timestamp=<S_SECS>.<NANOS> service="<ESC_STR>" method="<ESC_STR>" path="<ESC_STR>" <QUERY_FIELD> status=<U16> outcome=<OUTCOME> duration_ms=<F64_FIXED> truncated_fields=<TRUNC_FIELDS>\n
+OBSERVATION_V1 seq=<U64> timestamp=<S_SECS>.<NANOS> service="<ESC_STR>" method="<ESC_STR>" path="<ESC_STR>" <QUERY_FIELD> status=<U16> outcome=<OUTCOME> duration_ms=<INTEGER_DECIMAL_MS> truncated_fields=<TRUNC_FIELDS>\n
 ```
 
 Where:
 - `<QUERY_FIELD>`: `query="<ESC_STR>"` if query is present, or `query=none` if absent.
 - `<OUTCOME>`: One of `Success`, `BackendFailure`, `BackendTimeout`, `ClientTimeout`, `ClientFailure`, `Rejected`.
-- `<DURATION_MS>`: Formatted with microsecond precision (`{millis}.{micros:03}{nanos:03}`).
+- `<INTEGER_DECIMAL_MS>`: Integer-derived milliseconds with six fractional digits, preserving nanosecond resolution. No floating-point conversion is used. Classification compares the original `Duration` strictly against the threshold.
 - `<TRUNC_FIELDS>`: `none` or comma-separated list (`service`, `method`, `path`, `query`, `path_query`).
 
 ### 4.2 Anomaly Line (`ANOMALY_V1`)
@@ -178,7 +179,7 @@ Where:
 - **Prefix:** `ANOMALY_V1 `
 - **Grammar:**
 ```text
-ANOMALY_V1 seq=<U64> timestamp=<S_SECS>.<NANOS> service="<ESC_STR>" method="<ESC_STR>" status=<U16> outcome=<OUTCOME> origin=<ORIGIN> severity=<SEVERITY> duration_ms=<F64_FIXED> reasons=<REASONS> <THRESHOLD_FIELD> truncated_fields=<TRUNC_FIELDS>\n
+ANOMALY_V1 seq=<U64> timestamp=<S_SECS>.<NANOS> service="<ESC_STR>" method="<ESC_STR>" status=<U16> outcome=<OUTCOME> origin=<ORIGIN> severity=<SEVERITY> duration_ms=<INTEGER_DECIMAL_MS> reasons=<REASONS> <THRESHOLD_FIELD> truncated_fields=<TRUNC_FIELDS>\n
 ```
 
 Where:
@@ -306,7 +307,7 @@ The coordinator drain and writer flush are supervised under **one shared deadlin
 
 ### 7.2 Settled Counter Invariant Verification
 
-Upon clean shutdown, the snapshot is verified against mathematical invariants:
+Upon successful coordinator/writer completion, unsaturated counters are checked against mathematical invariants. Saturation prevents arithmetic proof; invariant failures return errors rather than panic:
 ```text
 evaluated == normal + anomalous
 matches_http_server_error <= anomalous
@@ -315,23 +316,29 @@ matches_upstream_timeout <= anomalous
 anomalous == events_queued + events_dropped_full + events_dropped_closed
 observations_written <= batches_queued
 events_written <= events_queued
+input_enqueued == evaluated
+evaluated == batches_queued + drops_obs_full + drops_obs_closed
+observations_written == batches_queued
+events_written == events_queued
 ```
 
 ### 7.3 Diagnostic Summaries on stderr
 
-Two bounded diagnostic lines (each at most 1,024 bytes) are emitted via `core_engine::diagnostic!`:
+Two diagnostic lines are attempted via `core_engine::diagnostic!`. Each formatter reserves the sink-appended newline: at most 1,023 content bytes and 1,024 total bytes. Full or closed diagnostic queues can drop either summary. Floored differences avoid underflow; failed/timed-out snapshots are incomplete, not transactional or settled.
 
 1. **`detection_stats` line**:
 ```text
-detection_stats evaluated=N normal=N anomalous=N http_5xx=N duration=N timeout=N batches_queued=N events_queued=N written_obs=N written_events=N drops_obs=N drops_events=N errors=N saturated=false
+detection_stats evaluated=N normal=N anomalous=N http_5xx=N duration=N timeout=N batches_queued=N events_queued=N drops_obs_full=N drops_obs_closed=N drops_events_full=N drops_events_closed=N truncated_obs=N truncated_events=N saturated=false
 ```
 
 2. **`anomaly_output` line**:
 ```text
-anomaly_output written=N unconfirmed=N state=clean|failed|timed_out
+anomaly_output written_obs=N written_events=N output_unconfirmed_obs=N output_unconfirmed_events=N write_errors=N input_enqueued=N input_dropped_full=N input_dropped_closed=N input_unevaluated=N input_unconfirmed=N state=clean|failed|timed_out
 ```
 
 Set `state=clean` only after confirmed coordinator completion, writer completion, and successful flush. On failure or timeout, do not label snapshots as settled. Include the relevant failure cause in a bounded, escaped diagnostic.
+
+Applicable settled identities must also pass before reporting clean completion. Retain an independent `Arc<DetectionStats>` because shutdown consumes the pipeline even on error. Input-unconfirmed means input acceptance minus complete normal writes; output-unconfirmed means accepted output minus complete writes. A successful `write_all` is not a flush acknowledgement or durable delivery. A clean telemetry state does not imply proxy startup succeeded, stderr delivery succeeded, or that no full-queue drops occurred.
 
 ---
 
@@ -339,20 +346,21 @@ Set `state=clean` only after confirmed coordinator completion, writer completion
 
 ### Step 1: Update CLI Parser & Argument Validation (`cli/src/main.rs`)
 - Add `--detect` (bool) and `--latency-threshold-ms` (Option<u64>) to `Command::Attach`.
-- Implement validation helper `validate_attach_args(detect: bool, threshold: Option<u64>, name: &str, listen: &SocketAddr) -> Result<Option<u64>, String>`.
+- Implement validation helper `validate_attach_args(detect: bool, threshold: Option<u64>, name: &str) -> Result<Option<DetectionConfig>, &'static str>`.
   - Validate `--latency-threshold-ms` requires `--detect`.
   - Validate range `1..=3_600_000`.
-  - Validate `--name`: non-empty, byte length ≤ 128, no ASCII control characters or newlines.
-  - Check non-loopback listen address and emit warning to diagnostics without mutating the address.
+  - With detection on, validate `--name`: nonblank, at most 128 escaped bytes, no control characters; detection-off acceptance remains unchanged.
+  - After validation, warn about a non-loopback listener without mutating the address.
 - In `main()` / `run()`:
-  - If validation fails, log diagnostic error, print error to stderr, and exit with code `2`.
+  - If validation fails, attempt bounded diagnostic reporting and return exit code `2` after the diagnostic completion wait.
   - If `!detect`, execute existing `print_observations` legacy path.
-  - If `detect`, construct `DetectionConfig`, spawn `TelemetryPipeline`, forward observer sender, await completion, execute supervised shutdown, emit diagnostic lines, and assert invariants.
+  - If `detect`, use the validated `DetectionConfig`, spawn the existing `TelemetryPipeline`, move the observer sender into the proxy, always supervise teardown (including on bind failure), check applicable invariants and emit summaries. Return errors rather than asserting/panicking on invariant failure.
 
 ### Step 2: Diagnostic Summary Formatting Helpers (`cli/src/reporting.rs`)
 - Add public functions to format the settled `detection_stats` and `anomaly_output` diagnostic lines within 1,024-byte guarantees:
-  - `pub fn format_detection_stats_diagnostic(snap: &DetectionStatsSnapshot) -> String`
-  - `pub fn format_anomaly_output_diagnostic(snap: &DetectionStatsSnapshot, state: &str) -> String`
+  - `pub fn format_detection_stats_diagnostic(snap: &DetectionStatsSnapshot) -> Result<String, RenderLimit>`
+  - `pub fn format_anomaly_output_diagnostic(snap: &DetectionStatsSnapshot, input: ObservationStatsSnapshot, state: CompletionState) -> Result<String, RenderLimit>`
+  - Use the explicit `Clean`, `Failed`, `TimedOut` enum variants; arbitrary strings and a boolean cannot express the completion contract safely.
 
 ### Step 2a: Security and Failure-Mode Integration
 - Make detection-mode startup transactional: if telemetry startup fails, do not leave a bound listener or partially active proxy; return an actionable error.
@@ -405,4 +413,7 @@ git diff --check
    - Stalled / broken stdout: report writer failure or timeout without blocking the async caller; a synchronous blocked writer thread may survive the wait deadline.
    - Clean shutdown: settled counter invariants hold.
 4. **Regression Smoke Tests:**
-   - `python scripts/smoke_fastapi.py` passes cleanly against M3 default mode.
+   - `python scripts/smoke_fastapi.py --include-timeouts` passes against M3 default mode.
+   - `python scripts/smoke_http_review.py` retains the existing M3 protocol and blocked-diagnostics assertions.
+   - `python scripts/smoke_m4_cli.py` checks CLI validation, real HTTP classification, bind failure and blocked/closed output in detection mode.
+   - Existing CI runs these on Linux and Windows. Record hosted results only for the exact tested SHA; local success does not imply hosted success. Broader M4.4 verification remains a separate milestone.

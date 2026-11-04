@@ -2,12 +2,12 @@
 
 # ExaProp
 
-**A high-performance, deterministic HTTP reverse proxy and resilience telemetry engine built with Rust.**
+**A deterministic HTTP reverse proxy and request telemetry engine built with Rust.**
 
 [![Status: Active Development](https://img.shields.io/badge/Status-Active_Development-success.svg)](#milestones--roadmap)
 [![Protocol: RFC 9110](https://img.shields.io/badge/Protocol-RFC_9110_HTTP%2F1.1-informational.svg)](#key-features)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Rust: Stable](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](rust-toolchain.toml)
+[![Rust: Stable](https://img.shields.io/badge/Rust-stable-orange.svg)](rust-toolchain.toml)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 [Quick Start](#quick-start) • [Architecture](#architecture) • [Features](#key-features) • [Observability](#structured-request-observability-m3) • [Anomaly Detection](#deterministic-anomaly-detection-m41) • [Roadmap](#milestones--roadmap) • [Contributing](#contributing)
@@ -31,9 +31,9 @@ Body sizes, active connections, queue counts and serialized V1 output lengths ar
 | **Zero-Blocking Network Core** | Asynchronous Tokio HTTP/1.x forwarding engine; telemetry emission uses non-blocking `try_send` so proxying is never stalled by slow terminal sinks. |
 | **Bounded Observability (M3)** | Captures monotonic processing durations (`Instant`), HTTP status codes, and typed outcome variants per request into a bounded 1,024-element queue. |
 | **Deterministic Anomaly Detection (M4.1)** | Pure, stateless rule classifier evaluating HTTP 5xx errors, strict nanosecond latency boundaries, and upstream timeouts with zero heap allocations. |
-| **Privacy-Safe Query Redaction** | Automatically detects and masks sensitive parameters (`token`, `secret`, `password`, `api_key`, `auth`) while preserving endpoint telemetry. |
-| **Memory & Resource Bounded** | Fixed 4 MiB body buffering limits, 16 concurrent client caps, bounded diagnostic channels, and deterministic shutdown timeouts. |
-| **Strict RFC 9110 Compliance** | Automatic hop-by-hop header stripping, Connection token validation, Via chain preservation, and proper 204 / 205 / 304 framing. |
+| **Best-Effort Query Redaction** | Masks recognized or ambiguous sensitive parameter names; paths, names and unrecognized values may still expose sensitive data. |
+| **Configured Resource Limits** | 4 MiB body limits, 16 active connections, bounded queues, and bounded shutdown completion waits; no fixed RSS or zero-OOM guarantee. |
+| **HTTP/1.x Correctness Checks** | Tested hop-by-hop header stripping, Connection token validation, Via chains, upstream 101 rejection, and 204 / 205 / 304 framing. |
 
 ---
 
@@ -77,7 +77,7 @@ Body sizes, active connections, queue counts and serialized V1 output lengths ar
 The architecture above depicts detection mode (`--detect`), whose coordinator sends to a bounded 256-batch queue before the stdout writer. Diagnostics use an independent stderr writer. Without detection, the default remains the legacy M3 observation printer.
 
 ### 1. Prerequisites
-- **Rust Toolchain:** Stable Rust (1.80+) via [rustup](https://rustup.rs/)
+- **Rust Toolchain:** Stable Rust via [rustup](https://rustup.rs/), as selected by `rust-toolchain.toml`; a tested minimum version is not declared
 - **Python 3:** For the bundled test backend
 - **curl:** For sending test HTTP requests
 
@@ -120,17 +120,17 @@ curl -i -X POST -d '{"event":"checkout"}' "http://127.0.0.1:8080/events"
 
 ## Structured Request Observability (M3)
 
-ExaProp guarantees **at most one observation per handled request**.
+ExaProp emits at most one observation per handled request. Parser rejections and cancelled handlers may emit none; full or closed queues can drop observations.
 
 ### Captured Observation Fields:
-* **Service Name:** Configured via `--name <id>` (escaped, non-empty identifier).
-* **HTTP Method:** Standard uppercase representation (`GET`, `POST`, `HEAD`, etc.).
+* **Service Name:** Configured via `--name <id>` and escaped for display; detection mode validates a nonblank, control-free name within 128 escaped bytes. Legacy acceptance is unchanged.
+* **HTTP Method:** Parsed method token (`GET`, `POST`, `HEAD`, or a valid extension method); extension tokens are preserved.
 * **Sanitized Path & Query:** Target path preserved; sensitive key values replaced with `[REDACTED]`.
 * **Status Code:** Raw 3-digit HTTP response code (e.g., `200`, `404`, `502`).
-* **Processing Latency:** High-precision monotonic elapsed duration (`std::time::Instant`) from request arrival to backend body completion.
+* **Processing Duration:** Monotonic elapsed time from parsed-handler entry through response buffering or proxy error selection. Includes client-body reads and upstream work; excludes header parsing, observation formatting/output and downstream delivery. See the [exact latency contract](documents/M3_OBSERVABILITY.md#exact-latency-semantics).
 * **Typed Outcome (`RequestOutcome`):**
   - `Success`: Valid HTTP exchange completed.
-  - `BackendFailure`: Connection refused, reset, or broken pipe upstream.
+  - `BackendFailure`: Upstream transport failure or a protocol/size/upgrade constraint violation; the exact root cause is not recorded.
   - `BackendTimeout`: Upstream response exceeded proxy timeout.
   - `ClientTimeout`: Downstream client stalled during body transmission.
   - `ClientFailure`: Downstream connection terminated prematurely.
@@ -186,9 +186,9 @@ exaprop attach [OPTIONS]
 
 ExaProp is engineered as an empirical testbed for **distributed systems resilience, cascading failure analysis, and fault observability**:
 
-1. **Monotonic Timing vs Wall-Clock Skew:** Eliminates NTP time synchronization artifacts by measuring latency strictly through hardware CPU ticks (`Instant`).
-2. **Backpressure Decoupling:** Evaluates producer-consumer isolation under load shedding, proving that slow logging pipelines cannot degrade reverse-proxy forwarding throughput.
-3. **Fault Provenance Isolation:** Formally distinguishes transport-layer breakdowns (TCP reset, connect errors) from protocol-level failures (HTTP 502/504 responses generated by intermediate gateways).
+1. **Monotonic Timing:** Uses `Instant` for processing duration, independently of the wall-clock timestamp. This is not a claim about hardware clock resolution or backend-only latency.
+2. **Telemetry Isolation:** HTTP handlers do not await telemetry queue capacity or output I/O. Shared CPU, allocation and scheduling costs still exist; no throughput guarantee follows from this isolation.
+3. **Response Provenance:** Distinguishes completed backend HTTP responses from proxy-generated failures through status and outcome evidence. `BackendFailure` does not distinguish individual transport and protocol causes.
 
 ---
 
@@ -201,7 +201,7 @@ ExaProp is engineered as an empirical testbed for **distributed systems resilien
 | **M2** | HTTP/1.1 correctness, body caps, hop headers & connection limits | Completed |
 | **M3** | Structured request observability & privacy-safe query redaction | Completed |
 | **M4.1** | Pure deterministic anomaly detection model & scalar invariants | Completed |
-| **M4.2** | Consumer-side pipeline coordinator, bounded queues & worker isolation | Implemented |
+| **M4.2** | Consumer-side pipeline coordinator, bounded queues & worker isolation | Merged into main in [PR #4](https://github.com/dineshyr29-04/exaprop/pull/4) |
 | **M4.3** | CLI anomaly reporting flags (`--detect`) and V1 telemetry formatting | Implemented on integration branch; hosted verification pending |
 | **M4.4** | End-to-end integration verification under simulated upstream faults | Planned |
 | **M4.5** | Production hardening, audit validation, and telemetry benchmarks | Planned |
