@@ -245,4 +245,4 @@ Contributions, bug reports, and research discussions are warmly welcomed!
 ## License
 
 ExaProp is licensed under the [Apache License, Version 2.0](LICENSE).  
-Copyright (c) 2026 Dinesh Y R & ExaProp Contributors.
+Copyright (c) 2026 Dinesh A & ExaProp Contributors.
