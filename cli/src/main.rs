@@ -317,7 +317,6 @@ async fn finish_detection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
 
     #[test]
     fn detection_flags_validate_defaults_boundaries_and_dependency() {
