@@ -18,9 +18,9 @@
 
 ## Overview
 
-**ExaProp** is a lightweight, zero-dependency, local HTTP/1.1 reverse proxy and distributed-systems resilience telemetry engine. Operating transparently between clients and upstream microservices, ExaProp records structured, monotonic execution facts and executes pure deterministic anomaly classification—**without ever blocking the request hot path or leaking sensitive payloads.**
+**ExaProp** is a local HTTP/1.x reverse proxy built with Rust, Tokio and Hyper. It records request observations and offers opt-in deterministic anomaly detection. HTTP handlers never wait for telemetry queue capacity or output I/O. Telemetry can be dropped, and paths, queries and service labels can contain sensitive data.
 
-Designed for high-concurrency microservice architectures, fault-injection research, and deterministic latency auditing, ExaProp enforces strict bounded memory guarantees (no unbounded queues, no OOM vulnerability) and zero shared mutable state.
+Body sizes, active connections, queue counts and serialized V1 output lengths are bounded. These limits do not establish a fixed process-memory ceiling or eliminate resource-exhaustion risks. See the [usage guide](documents/EXAPROP_USAGE.md) for supported protocols and operational limits.
 
 ---
 
@@ -73,6 +73,8 @@ Designed for high-concurrency microservice architectures, fault-injection resear
 ---
 
 ## Quick Start
+
+The architecture above depicts detection mode (`--detect`), whose coordinator sends to a bounded 256-batch queue before the stdout writer. Diagnostics use an independent stderr writer. Without detection, the default remains the legacy M3 observation printer.
 
 ### 1. Prerequisites
 - **Rust Toolchain:** Stable Rust (1.80+) via [rustup](https://rustup.rs/)
@@ -154,6 +156,16 @@ ExaProp includes a pure, mathematically deterministic anomaly detection engine i
 
 ## CLI Reference
 
+Enable CLI anomaly reporting (M4.3) against an existing plain HTTP backend:
+
+```text
+exaprop attach --target 127.0.0.1:8000 --name orders --detect --latency-threshold-ms 500
+```
+
+This emits bounded `OBSERVATION_V1` lines and at most one `ANOMALY_V1` line per evaluated observation, containing all matching reasons. Duration-only events are warnings; HTTP 5xx and upstream-timeout events are errors. Detection is best effort over received observations, not a complete request census. Anomaly lines omit paths, queries, headers and bodies, but include potentially sensitive service/method labels. See [commands, output, loss accounting and exit codes](documents/EXAPROP_USAGE.md#enable-anomaly-detection-m43).
+
+Backends need no ExaProp SDK: supported plain HTTP behavior works across languages. Python/FastAPI and a standard-library HTTP backend have automated checks; Express has a manual example. Other frameworks are protocol-compatible candidates, not individually verified integrations.
+
 ```bash
 exaprop attach [OPTIONS]
 ```
@@ -163,6 +175,8 @@ exaprop attach [OPTIONS]
 | **Listen Address** | `--listen <ADDR>` | `127.0.0.1:8080` | Local socket address to bind and receive client traffic |
 | **Target Address** | `--target <ADDR>` | `127.0.0.1:8081` | Upstream backend socket address to forward traffic to |
 | **Service Label** | `--name <NAME>` | `backend-service` | Service identifier used to tag telemetry observations |
+| **Anomaly Detection** | `--detect` | off | Enable all three anomaly rules and V1 output |
+| **Duration Threshold** | `--latency-threshold-ms <INTEGER>` | `1000` with detection | Range 1–3,600,000; requires `--detect`; strict duration comparison |
 | **Help** | `-h`, `--help` | — | Print command-line help information |
 | **Version** | `-V`, `--version` | — | Print version information |
 
@@ -187,8 +201,8 @@ ExaProp is engineered as an empirical testbed for **distributed systems resilien
 | **M2** | HTTP/1.1 correctness, body caps, hop headers & connection limits | Completed |
 | **M3** | Structured request observability & privacy-safe query redaction | Completed |
 | **M4.1** | Pure deterministic anomaly detection model & scalar invariants | Completed |
-| **M4.2** | Consumer-side pipeline coordinator, bounded queues & worker isolation | In Progress |
-| **M4.3** | CLI anomaly reporting flags (`--detect`) and V1 telemetry formatting | Planned |
+| **M4.2** | Consumer-side pipeline coordinator, bounded queues & worker isolation | Implemented |
+| **M4.3** | CLI anomaly reporting flags (`--detect`) and V1 telemetry formatting | Implemented on integration branch; hosted verification pending |
 | **M4.4** | End-to-end integration verification under simulated upstream faults | Planned |
 | **M4.5** | Production hardening, audit validation, and telemetry benchmarks | Planned |
 | **M5+** | Controlled fault injection, chaos orchestration & resilience metrics | Research Horizon |

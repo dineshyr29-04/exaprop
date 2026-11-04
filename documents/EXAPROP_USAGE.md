@@ -1,6 +1,6 @@
 # ExaProp practical HTTP usage guide
 
-ExaProp M3 forwards plain HTTP to one backend and prints request observations. Direct clients to its listening address. The backend needs no ExaProp SDK. Use local development environments or controlled networks with systems you own.
+ExaProp forwards plain HTTP to one backend and prints request observations. M4.3 adds opt-in anomaly detection. Direct clients to its listening address. The backend needs no ExaProp SDK. Use local development environments or controlled networks with systems you own.
 
 ## Build and install
 
@@ -44,6 +44,63 @@ curl -I "http://127.0.0.1:8080/health"
 In Windows PowerShell, use `curl.exe` if `curl` is an alias. The GET body is `GET /hello?page=2` followed by a newline; POST echoes the bytes. Requests sent directly to port 8081 bypass ExaProp. Stop the proxy with Ctrl+C and let it finish draining.
 
 For another existing HTTP backend, set `--target` to its numeric IP and port. For example, a backend on port 3000 uses `--target 127.0.0.1:3000`. Addresses must be socket addresses, not URLs or DNS names. IPv6 uses brackets, for example `[::1]:3000`. Keep listen and target different and never target the proxy itself.
+
+## Enable anomaly detection (M4.3)
+
+Build or reinstall from the M4.3 checkout before using these flags. In your proxy terminal:
+
+```text
+exaprop attach --listen 127.0.0.1:8080 --target 127.0.0.1:8081 --name orders --detect
+exaprop attach --target 127.0.0.1:8081 --name orders --detect --latency-threshold-ms 500
+```
+
+`--detect` enables all three rules with a default threshold of 1,000 ms. The optional threshold is an unsigned integer from 1 through 3,600,000 ms and requires `--detect`. Duplicate detection/threshold flags, zero, negatives, fractions, overflow and invalid integers are usage errors (exit 2) before a listener or telemetry workers start. No value disables a rule. A duration must be strictly greater than the threshold, using exact nanoseconds; a duration equal to the threshold does not match.
+
+With detection enabled, `--name` must be nonblank, contain no control characters, and fit in 128 bytes after V1 escaping. An ordinary ASCII name can use up to 128 bytes; a four-byte emoji occupies 16 encoded bytes. Names and HTTP methods may contain sensitive identifiers: choose a nonsecret service label. This policy does not attempt to detect every secret. Detection-off commands retain the existing name behavior and legacy observation format.
+
+V1 output on stdout contains an `OBSERVATION_V1` line for every output batch and at most one following `ANOMALY_V1` line. The pair shares a run-local `seq`. Reasons appear in this order: HTTP 500–599, duration above threshold, `BackendTimeout`. Duration-only events have severity `warning`; events matching HTTP 5xx or upstream timeout have severity `error`.
+
+```text
+OBSERVATION_V1 seq=1 timestamp=42.000000000 service="orders" method="GET" path="/items" query=none status=503 outcome=Success duration_ms=1500.000001 truncated_fields=none
+ANOMALY_V1 seq=1 timestamp=42.000000000 service="orders" method="GET" status=503 outcome=Success origin=backend severity=error duration_ms=1500.000001 reasons=http_server_error,elevated_request_duration threshold_ms=1000 truncated_fields=none
+```
+
+Decimal durations use integer arithmetic with six fractional millisecond digits, preserving nanosecond resolution. They measure parsed-handler processing through response buffering/error selection, not client delivery or backend-only time. A backend 504 has `outcome=Success` and `origin=backend`; it does not imply an upstream-timeout reason. A proxy timeout has `outcome=BackendTimeout` and `origin=proxy`. An anomaly reports matched evidence, not a root cause.
+
+Observation lines are capped at 4,096 encoded bytes and anomaly lines at 1,024, including newline. Quoted fields escape quotes, backslashes, controls and non-ASCII UTF-8 bytes (`\xHH`). Variable fields may be shortened at complete escape boundaries, identified by `truncated_fields`; `path_query` means both were shortened. Required scalar evidence is never truncated. Anomaly lines exclude path, query, headers and bodies. Normal lines retain paths and sanitized queries, whose redaction is best effort; protect and limit retention of both streams.
+
+### Delivery, shutdown and exit codes
+
+Input acceptance does not guarantee detection or delivery. The 1,024-record input queue and 256-batch output queue use nonblocking submission. Full queues drop records/batches; unknown input losses cannot be classified. This bounds queue counts and output lengths, not total process memory.
+
+After Ctrl+C (or Unix SIGTERM/Windows Ctrl+Break), the proxy allows up to two seconds for connections, then the coordinator and writer share a single two-second telemetry wait deadline. Diagnostics have their own final two-second drain. A blocked synchronous writer may survive the wait until process exit. Timing includes scheduling overhead and is not a hard real-time guarantee.
+
+Two best-effort stderr summaries describe completion:
+
+| Prefix | Meaning |
+| --- | --- |
+| `detection_stats` | Evaluated/normal/anomalous counts, rule matches, accepted batches/events, output full/closed drops, truncation and counter saturation |
+| `anomaly_output` | Written lines, accepted-output unconfirmed counts, input accepted/full/closed drops, input unevaluated/unconfirmed counts, write errors, and `state=clean`, `failed` or `timed_out` |
+
+`input_unconfirmed` is input acceptance minus completed normal writes; it includes output drops as well as unfinished work. `output_unconfirmed_obs`/`output_unconfirmed_events` count accepted output whose line writes are unconfirmed. Differences are floored at zero. Failed/timed-out snapshots are incomplete and may change before exit; concurrent atomic reads are not a transaction. Saturated counters cannot prove arithmetic identities.
+
+`state=clean` means both telemetry workers completed, the final flush succeeded and applicable settled identities passed. It does not mean that no queue drops occurred, that the proxy started successfully, or that diagnostics were delivered. “Written” means a complete successful `write_all`, not flushed or durable storage. Summaries may be dropped if stderr is full/closed.
+
+Exit 0 indicates successful proxy/telemetry/diagnostics completion. Runtime failures, invariant failures, broken output or drain timeouts produce exit 1; queue-full drops alone do not. Usage errors return 2 through bounded, escaped diagnostics and no proxy startup. Help/version use stdout with a bounded completion wait. Selecting a non-loopback listener emits a warning: ExaProp supplies no TLS, authentication or access control.
+
+### Backend language compatibility
+
+No SDK, instrumentation package or language adapter is required. A supported plain HTTP/1.x backend can be written in Python (FastAPI/Django/Flask), JavaScript/TypeScript (Express/Fastify), Go, Java/Kotlin, C#, Rust, PHP, Ruby or another language. Configure its numeric socket address and send client requests through the proxy. This describes protocol compatibility, not a claim that every framework/version has been tested. The bundled FastAPI and standard-library backend suites provide the executed examples; Express has a manual example below.
+
+HTTPS, HTTP/2, gRPC, WebSockets and streaming/SSE are outside the current proxy contract. Keep the existing 4 MiB buffering, concurrency, timeout and redaction limitations in mind regardless of backend language.
+
+To repeat CLI acceptance checks after a release build:
+
+```text
+python scripts/smoke_m4_cli.py
+```
+
+This includes real 15-second proxy timeout cases, flag validation, V1 evidence checks, failed binding, blocked stdout/stderr and closed stdout. Evidence is stored under `tmp/m4-cli/`. Both existing M3 smoke commands remain required as regression checks.
 
 ## FastAPI
 

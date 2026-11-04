@@ -2,6 +2,8 @@
 
 This document defines the implemented observation, privacy, latency, and shutdown behavior. It supersedes descriptions in the historical [verification report](../docs/m3-observability-review.md). The broader [external test guide](M3_OBSERVABILITY_TESTING.md) remains available for manual experiments.
 
+M4.3 adds an opt-in CLI consumer through `attach --detect`. The legacy format and single-consumer behavior described here remain the default. Detection mode uses the same observations and HTTP engine, with an extra bounded output queue, V1 records and `detection_stats`/`anomaly_output` summaries instead of the legacy `observation_output` line. Its delivery/privacy differences and command examples are documented in the [usage guide](EXAPROP_USAGE.md#enable-anomaly-detection-m43).
+
 ## Queue accounting
 
 Observation delivery never waits for capacity. Each completed emission attempt increments exactly one process-local counter:
