@@ -246,18 +246,14 @@ pub fn format_timestamp(ts: SystemTime) -> String {
         Ok(dur) => format!("{}.{:09}", dur.as_secs(), dur.subsec_nanos()),
         Err(err) => {
             let dur = err.duration();
-            let secs = dur.as_secs();
-            let nanos = dur.subsec_nanos();
-            if nanos == 0 {
-                format!("-{secs}.000000000")
-            } else {
-                format!("-{}.{:09}", secs + 1, 1_000_000_000 - nanos)
-            }
+            // A signed decimal applies the minus sign to the entire magnitude,
+            // e.g. one nanosecond before the epoch is -0.000000001.
+            format!("-{}.{:09}", dur.as_secs(), dur.subsec_nanos())
         }
     }
 }
 
-/// Format duration in milliseconds with 6 decimal places (microsecond resolution).
+/// Format integer-derived milliseconds with 6 decimal places (nanosecond resolution).
 pub fn format_duration_ms(dur: Duration) -> String {
     let total_ms = dur.as_millis();
     let micros_frac = (dur.subsec_nanos() % 1_000_000) / 1000;
@@ -1053,6 +1049,25 @@ mod tests {
             }
             assert_eq!(stats.snapshot(), DetectionStatsSnapshot::default());
         }
+    }
+
+    #[test]
+    fn timestamps_preserve_signed_decimal_values_around_the_epoch() {
+        for (duration, expected) in [
+            // Windows SystemTime uses 100 ns ticks; use representable values
+            // here while Duration-based detector tests keep 1 ns boundaries.
+            (Duration::from_nanos(100), "-0.000000100"),
+            (Duration::from_millis(500), "-0.500000000"),
+            (Duration::from_secs(1), "-1.000000000"),
+            (Duration::from_millis(1500), "-1.500000000"),
+        ] {
+            assert_eq!(format_timestamp(UNIX_EPOCH - duration), expected);
+        }
+        assert_eq!(format_timestamp(UNIX_EPOCH), "0.000000000");
+        assert_eq!(
+            format_timestamp(UNIX_EPOCH + Duration::from_nanos(100)),
+            "0.000000100"
+        );
     }
 
     #[test]
