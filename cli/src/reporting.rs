@@ -834,6 +834,7 @@ impl Drop for StartupGate {
 
 impl TelemetryPipeline {
     /// Spawn dedicated coordinator and writer threads with bounded queues.
+    /// Returns InvalidInput for zero capacity or capacity exceeding Tokio's limit.
     pub fn spawn<W>(
         observation_capacity: usize,
         detector: Detector,
@@ -847,6 +848,7 @@ impl TelemetryPipeline {
     }
 
     /// Spawn dedicated coordinator and writer threads with injectable initial sequence for testing.
+    /// The initial sequence must be nonzero; invalid input never starts workers.
     pub fn spawn_with_initial_seq<W>(
         observation_capacity: usize,
         detector: Detector,
@@ -883,6 +885,15 @@ impl TelemetryPipeline {
     where
         W: Write + Send + 'static,
     {
+        if observation_capacity == 0
+            || observation_capacity > tokio::sync::Semaphore::MAX_PERMITS
+            || initial_seq == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "telemetry requires a nonzero supported queue capacity and initial sequence",
+            ));
+        }
         let (obs_tx, obs_rx) = mpsc::channel(observation_capacity);
         let (out_tx, out_rx) = mpsc::channel(OUTPUT_BATCH_CAPACITY);
         let (coord_done_tx, coord_done_rx) = oneshot::channel();
@@ -937,8 +948,17 @@ impl TelemetryPipeline {
     ///
     /// Drains the coordinator first, then the writer. If the timeout expires,
     /// returns `TimedOut` without synchronously blocking Tokio workers on detached threads.
+    /// An unrepresentable deadline returns InvalidInput. A blocked synchronous
+    /// writer may remain blocked after this future returns; threads are not joined.
     pub async fn shutdown(self, timeout: Duration) -> io::Result<DetectionStatsSnapshot> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "telemetry shutdown deadline is not representable",
+                )
+            })?;
 
         // Drop the pipeline's own clone so input closes once all external producers drop
         drop(self.observation_tx);
@@ -984,6 +1004,38 @@ mod tests {
     use core_engine::{
         detection::DetectionConfig, Method, Observation, RequestOutcome, StatusCode,
     };
+
+    #[test]
+    fn invalid_pipeline_configuration_is_rejected_before_spawning_workers() {
+        for (capacity, seq) in [(0, 1), (usize::MAX, 1), (1, 0)] {
+            let result = TelemetryPipeline::spawn_with_workers(
+                capacity,
+                Detector::new(DetectionConfig::default()),
+                io::sink(),
+                DetectionStats::new_shared(),
+                seq,
+                |_, _| panic!("invalid configuration must not spawn a worker"),
+            );
+            match result {
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidInput),
+                Ok(_) => panic!("invalid configuration was accepted"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_shutdown_deadline_returns_error_without_panicking() {
+        let (pipeline, tx) = TelemetryPipeline::spawn(
+            1,
+            Detector::new(DetectionConfig::default()),
+            io::sink(),
+            DetectionStats::new_shared(),
+        )
+        .unwrap();
+        drop(tx);
+        let error = pipeline.shutdown(Duration::MAX).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn timestamps_preserve_signed_decimal_values_around_the_epoch() {
