@@ -1,6 +1,6 @@
 # Contributing to ExaProp
 
-Contributions to code, tests, documentation, reproducible experiments, and tooling are welcome. M3 HTTP observability and M4.1–M4.3 anomaly detection are implemented on the integration branch; later M4 phases remain planned. Check the [README](README.md#milestones--roadmap) before assuming a roadmap feature exists.
+Contributions to code, tests, documentation, reproducible experiments, and tooling are welcome. M3 HTTP observability and M4.1–M4.3 anomaly detection are merged into main; M4.4 adds integration verification on its feature branch. Check the [README](README.md#milestones--roadmap) before assuming a roadmap feature exists.
 
 ## Propose a change
 
@@ -71,6 +71,7 @@ cargo build --workspace --release --locked
 .\.venv\Scripts\python.exe scripts/smoke_fastapi.py --include-timeouts
 .\.venv\Scripts\python.exe scripts/smoke_http_review.py
 .\.venv\Scripts\python.exe scripts/smoke_m4_cli.py
+.\.venv\Scripts\python.exe scripts/smoke_m4.py
 ```
 
 Linux/macOS:
@@ -81,11 +82,12 @@ cargo build --workspace --release --locked
 .venv/bin/python scripts/smoke_fastapi.py --include-timeouts
 .venv/bin/python scripts/smoke_http_review.py
 .venv/bin/python scripts/smoke_m4_cli.py
+.venv/bin/python scripts/smoke_m4.py
 ```
 
 Use `python3` to create the environment if that is your system command. The suites start local child backends and proxies and clean them up. Allow loopback sockets and child-process execution. FastAPI deliberately exercises two 15-second timeout paths; HTTP review exercises malformed headers, Via chains, upstream 101, HTTP 205 wire framing, the echo backend, and blocked/closed stderr. Keep the full timeout run when validating changes to these areas.
 
-Evidence is saved under ignored `tmp/fastapi-smoke/`, `tmp/http-review/` and `tmp/m4-cli/` directories. The M4.3 suite verifies CLI validation, V1 output, real timeouts, failed binding and blocked/closed sinks. CI runs all three suites on Linux and Windows and retains available smoke evidence for seven days, even after a failed step. A cancelled job may not finish writing or uploading evidence. Do not commit local virtual environments, build output, or logs. Review captured data before sharing it.
+Evidence is saved under ignored `tmp/fastapi-smoke/`, `tmp/http-review/`, `tmp/m4-cli/` and `tmp/m4/` directories. M4.3 verifies CLI validation, V1 output, timeouts, binding and blocked/closed sinks. M4.4 adds real FastAPI/client/transport failures, concurrent traffic, anomalous-request privacy and exact settled counters. CI runs all four suites on Linux and Windows and retains available smoke evidence for seven days, even after a failed step. A cancelled job may not finish writing or uploading evidence. Do not commit local virtual environments, build output, or logs. Review captured data before sharing it.
 
 ### Workflow and issue-form changes
 
