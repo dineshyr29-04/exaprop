@@ -1,5 +1,7 @@
 //! Reusable networking and proxy functionality for ExaProp.
 
+mod counters;
+
 pub mod detection;
 pub mod diagnostics;
 pub mod observation;

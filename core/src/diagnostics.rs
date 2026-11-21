@@ -28,6 +28,7 @@ struct Counters {
 }
 
 /// Independent atomic reads; consistent totals are available after producers stop.
+/// Counts saturate at u64::MAX instead of wrapping; totals at that limit are inexact.
 #[derive(Debug, Clone, Copy)]
 pub struct DiagnosticSnapshot {
     pub enqueued: u64,
@@ -95,10 +96,10 @@ impl Diagnostics {
                     match command {
                         Command::Message(message) => {
                             if writeln!(writer, "{message}").is_err() {
-                                worker_counters.write_errors.fetch_add(1, Ordering::Relaxed);
+                                crate::counters::increment(&worker_counters.write_errors);
                                 return;
                             }
-                            worker_counters.written.fetch_add(1, Ordering::Relaxed);
+                            crate::counters::increment(&worker_counters.written);
                         }
                         Command::Finish(done) => {
                             let stats = worker_counters.snapshot();
@@ -109,7 +110,7 @@ impl Diagnostics {
                                 stats.enqueued.saturating_sub(stats.written),
                             ).and_then(|()| writer.flush());
                             if result.is_err() {
-                                worker_counters.write_errors.fetch_add(1, Ordering::Relaxed);
+                                crate::counters::increment(&worker_counters.write_errors);
                             }
                             let _ = done.send(result);
                             return;
@@ -118,7 +119,7 @@ impl Diagnostics {
                 }
             });
         if spawned.is_err() {
-            counters.spawn_errors.fetch_add(1, Ordering::Relaxed);
+            crate::counters::increment(&counters.spawn_errors);
         }
         Self { sender, counters }
     }
@@ -130,17 +131,17 @@ impl Diagnostics {
         };
         let _ = message.write_fmt(arguments);
         if message.truncated {
-            self.counters.truncated.fetch_add(1, Ordering::Relaxed);
+            crate::counters::increment(&self.counters.truncated);
         }
         match self.sender.try_send(Command::Message(message.text)) {
             Ok(()) => {
-                self.counters.enqueued.fetch_add(1, Ordering::Relaxed);
+                crate::counters::increment(&self.counters.enqueued);
             }
             Err(TrySendError::Full(_)) => {
-                self.counters.full.fetch_add(1, Ordering::Relaxed);
+                crate::counters::increment(&self.counters.full);
             }
             Err(TrySendError::Disconnected(_)) => {
-                self.counters.closed.fetch_add(1, Ordering::Relaxed);
+                crate::counters::increment(&self.counters.closed);
             }
         }
     }
@@ -211,6 +212,18 @@ macro_rules! diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn diagnostic_delivery_counters_do_not_wrap() {
+        let logger = Diagnostics::start(io::sink(), 2);
+        logger.counters.enqueued.store(u64::MAX, Ordering::Relaxed);
+        logger.counters.written.store(u64::MAX, Ordering::Relaxed);
+        logger.emit(format_args!("capacity boundary"));
+        logger.finish(Duration::from_secs(2)).await.unwrap();
+        let snapshot = logger.counters.snapshot();
+        assert_eq!(snapshot.enqueued, u64::MAX);
+        assert_eq!(snapshot.written, u64::MAX);
+    }
 
     #[tokio::test]
     async fn blocked_writer_drops_at_capacity_without_blocking_producer() {
