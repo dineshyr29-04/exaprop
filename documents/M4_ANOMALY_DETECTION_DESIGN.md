@@ -1,6 +1,10 @@
 # M4 — Deterministic HTTP anomaly detection
 
-Status: **M4.1–M4.3 merged; M4.4 integration campaign implemented on `m44`; M4.5 final hardening remains pending**. Local execution, hosted verification and merge approval are separate evidence.
+Status: **M4.1–M4.4 merged; M4.5 final hardening implemented on `codex/m4-final-hardening`, not merged**. Local execution, hosted verification and merge approval are separate evidence.
+
+M4.5 audit baseline: merged M4.4 main at `e4852a69aa91316135077c2fb10ff7b7ee0a72a0` (PR #6). Demonstrated numeric-wrap regressions are fixed by saturating the legacy input/diagnostic/written counters without changing their fields or normal output. Invalid queue capacity/initial sequence and unrepresentable shutdown deadlines now return `InvalidInput` before worker startup or deadline arithmetic, instead of panicking. A real partial-write regression exercises both normal and anomaly-line accounting and completion-channel errors. These are reliability boundary fixes, not a claim of remotely exploitable vulnerabilities or complete security. Private vulnerability reporting was enabled with maintainer approval. No M5 behavior, protocol feature, queue redesign or anomaly-schema change is included.
+
+The smoke-only Python dependency `opentelemetry-api` was updated from `1.45.1` to `1.45.2` after dependency auditing identified [GHSA-mf5v-w3w3-f6cg](https://github.com/advisories/GHSA-mf5v-w3w3-f6cg), a trace-context extraction denial-of-service advisory. This is not a Rust runtime dependency; the pin update does not imply that the proxy or existing smoke routes exposed the affected extraction path. Advisory scans cover known published findings, not all possible vulnerabilities.
 
 Repository baseline review (21 November 2026): M4.2 merged in PR #4 (`c3c0ffee003200a07dbda65fb250ddcc3e4b9a04`), M4.3 merged in PR #5 (`b3d23e6f37ad2e83d9f0b0b1c1acf92c1d173628`). M4.4 starts from main at `ee0fe65c6bb1cdf51d5eeee0dd965f3997507058`. The original design baseline below is retained as historical context.
 
@@ -372,7 +376,7 @@ Future integration evidence should include typed event fixtures/parsed fields, a
 
 ## 16. Implementation phases
 
-The phase table retains the approved scope and acceptance targets. M4.1–M4.3 are merged; M4.4 integration verification is implemented on its feature branch. M4.5 and later functionality require their own work and review; this document is not automatic authorization for future milestones.
+The phase table retains the approved scope and acceptance targets. M4.1–M4.4 are merged; M4.5 final hardening is implemented on its review branch. Later functionality requires separate design/implementation authorization; this document is not automatic authorization for future milestones.
 
 | Phase | Expected files | Responsibilities | Tests / acceptance | Dependencies |
 | --- | --- | --- | --- | --- |
@@ -418,4 +422,4 @@ Expected runtime additions are one pure core module and one small CLI reporting 
 
 M4 does not include machine learning, adaptive statistical baselines, anomaly prediction, root-cause analysis, cross-service tracing, distributed correlation, fault injection, circuit breakers, automatic retries, anomaly-based request blocking, dashboards, persistent storage, cloud infrastructure, or OpenTelemetry exporters. It does not add HTTPS, streaming transport, new HTTP behavior, arbitrary output sinks, or a remote management service.
 
-Future proposals can revisit these topics with evidence and their own scope. M4.4 verifies the existing detector/pipeline/CLI rather than extending proxy behavior. **M4.5 final hardening and later feature milestones remain separate from this integration campaign.**
+Future proposals can revisit these topics with evidence and their own scope. M4.4 verifies the detector/pipeline/CLI; M4.5 hardens demonstrated boundary issues and audits existing guarantees. **M5 and later feature milestones remain separate and are not implemented here.**

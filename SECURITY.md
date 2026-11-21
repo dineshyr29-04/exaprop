@@ -6,11 +6,9 @@ ExaProp is an early-stage HTTP proxy and observability project. Security concern
 
 **Do not report suspected vulnerabilities through public issues, pull requests, discussions, or CI logs.** Do not upload credentials, authorization headers, private URLs, traffic captures, or exploit details publicly.
 
-GitHub private vulnerability reporting is currently disabled for this repository (verified 22 October 2026). No alternate private security contact is published in the repository. This is a reporting-channel gap, not an invitation to disclose publicly. If you already have a verified private channel to a maintainer, use it; otherwise withhold sensitive details until a private route is established.
+GitHub private vulnerability reporting is enabled for this repository (enabled with maintainer approval and verified through the repository API on 21 November 2026).
 
-**Maintainer action required:** enable private vulnerability reporting under the repository's security settings, or publish a verified private contact here. No response-time commitment or contact address is implied by this policy.
-
-Once private reporting is enabled, open the repository's **Security → Advisories → Report a vulnerability** flow and submit the report privately. The current [advisories page](https://github.com/dineshyr29-04/exaprop/security/advisories) is not itself proof that private reporting is enabled.
+Open **Security → Advisories → Report a vulnerability**, or use the [private reporting form](https://github.com/dineshyr29-04/exaprop/security/advisories/new), and submit the report privately. If that flow is unavailable, do not fall back to a public issue; use an already verified private maintainer channel or withhold sensitive details until private reporting is restored. No security email address or response-time commitment is published or implied.
 
 A useful private report includes:
 
