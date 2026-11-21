@@ -1,8 +1,10 @@
 # M4 — Deterministic HTTP anomaly detection
 
-Status: **M4.1 pure model, M4.2 pipeline and M4.3 opt-in CLI integration implemented on the M4.3 working branch; M4.4–M4.5 remain unimplemented**. Working-tree validation is distinct from hosted CI or merge approval.
+Status: **M4.1–M4.3 merged; M4.4 integration campaign implemented on `m44`; M4.5 final hardening remains pending**. Local execution, hosted verification and merge approval are separate evidence.
 
-Repository baseline review (4 November 2026): M4.2 is merged into `main` by PR #4, commit `c3c0ffee003200a07dbda65fb250ddcc3e4b9a04`. The M4.3 branch incorporates that main commit without rewriting its existing feature commits. M4.3 remains separate from main pending its own verification/review and merge decision. The original design baseline below is retained as historical context.
+Repository baseline review (21 November 2026): M4.2 merged in PR #4 (`c3c0ffee003200a07dbda65fb250ddcc3e4b9a04`), M4.3 merged in PR #5 (`b3d23e6f37ad2e83d9f0b0b1c1acf92c1d173628`). M4.4 starts from main at `ee0fe65c6bb1cdf51d5eeee0dd965f3997507058`. The original design baseline below is retained as historical context.
+
+M4.4 adds [smoke_m4.py](../scripts/smoke_m4.py), reusing the existing FastAPI fixture, signal/request helpers and V1 parsers. It verifies real backend statuses, transport outage/recovery, client/upstream timeouts, concurrent traffic, privacy sentinels on anomalous requests, and exact classification/output/input counters after clean drainage. An incomplete-client shutdown check exercises the documented observation gap. The existing M3/M4.3 suites retain their assertions and cover default parity, protocol regressions and blocked/closed sinks. All four suites are required by CI on Linux and Windows; configured coverage alone does not imply executed results. No runtime proxy/detector, queue, schema or dependency change is needed for this campaign.
 
 Design date: 23 October 2026 (Asia/Calcutta). Source baseline: `origin/main` at `6c862edb86e88abd9ef1d6ede80d14a6821743d8`. Design branch: `m4-anomaly-detection`. Both the M3 merge and repository-standards merge are ancestors of this baseline. The original design-only change added this document without runtime code. M4.1 was subsequently authorized separately and implemented in `core/src/detection.rs`, with its module export in `core/src/lib.rs`, through commit `8cb673a584431f79527e80ca089c2ad048c2b1e0`. M4.2 was implemented in `cli/src/reporting.rs` under feature branch `m4-pipeline`.
 
@@ -323,7 +325,7 @@ Total intended shutdown budget remains approximately two seconds connection grac
 
 ## 15. Testing strategy
 
-The table spans all M4 phases. M4.1 implements the pure-model portions in `detection.rs`; CLI, queue, output, counter, and lifecycle scenarios remain planned. Do not infer that all cases below were executed from the model's implementation status. Assert typed `Anomaly` fields and exact settled counters where applicable, not just an `ANOMALY` substring. Use synthetic durations/SystemTime values for rule tests, barriers/channels for races, injected short lifecycle deadlines for unit tests, and no long unit-test sleeps.
+The table spans all M4 phases. M4.1 implements pure-model portions in `detection.rs`; M4.2/M4.3 implement queue, output, counter, lifecycle and CLI coverage. M4.4 adds the real-backend campaign described above. Do not infer that every case below executed on every platform from implementation status alone. Assert typed `Anomaly` fields and exact settled counters where applicable, not just an `ANOMALY` substring. Use synthetic durations/SystemTime values for rule tests, barriers/channels for races, injected short lifecycle deadlines for unit tests, and no long unit-test sleeps.
 
 Abbreviations: S = HTTP server error; D = elevated request duration; U = upstream timeout. Unless noted, threshold is 1,000 ms and duration 10 ms. For an isolated accepted/written anomalous record, expect `evaluated=1, anomalous=1, normal=0, events_queued=1, events_written=1`; only its matched per-rule counters increment. For a normal one, expect `evaluated=1, normal=1, anomalous=0` and all event counters zero.
 
@@ -370,7 +372,7 @@ Future integration evidence should include typed event fixtures/parsed fields, a
 
 ## 16. Implementation phases
 
-Every phase requires separate implementation authorization. M4.1 was authorized and implemented separately from this original design document. M4.2 and subsequent phases have not started; their descriptions below are implementation plans, not existing functionality.
+The phase table retains the approved scope and acceptance targets. M4.1–M4.3 are merged; M4.4 integration verification is implemented on its feature branch. M4.5 and later functionality require their own work and review; this document is not automatic authorization for future milestones.
 
 | Phase | Expected files | Responsibilities | Tests / acceptance | Dependencies |
 | --- | --- | --- | --- | --- |
@@ -416,4 +418,4 @@ Expected runtime additions are one pure core module and one small CLI reporting 
 
 M4 does not include machine learning, adaptive statistical baselines, anomaly prediction, root-cause analysis, cross-service tracing, distributed correlation, fault injection, circuit breakers, automatic retries, anomaly-based request blocking, dashboards, persistent storage, cloud infrastructure, or OpenTelemetry exporters. It does not add HTTPS, streaming transport, new HTTP behavior, arbitrary output sinks, or a remote management service.
 
-Future proposals can revisit these topics with evidence and their own scope. M4.1 implements only the pure classifier over supplied observations. **Stop after M4.1 verification; do not begin M4.2 or later phases without separate approval.**
+Future proposals can revisit these topics with evidence and their own scope. M4.4 verifies the existing detector/pipeline/CLI rather than extending proxy behavior. **M4.5 final hardening and later feature milestones remain separate from this integration campaign.**

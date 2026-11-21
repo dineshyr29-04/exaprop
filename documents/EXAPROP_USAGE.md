@@ -104,6 +104,14 @@ python scripts/smoke_m4_cli.py
 
 This includes real 15-second proxy timeout cases, flag validation, V1 evidence checks, failed binding, blocked stdout/stderr and closed stdout. Evidence is stored under `tmp/m4-cli/`. Both existing M3 smoke commands remain required as regression checks.
 
+The M4.4 integration campaign extends this verification against the bundled FastAPI backend:
+
+```text
+python scripts/smoke_m4.py
+```
+
+It checks backend 500/503/504, backend outage/restart, real upstream header/body timeouts and a client-body timeout, concurrent traffic, anomalous-request privacy, and every scalar classification/delivery counter after clean settlement. It also checks shutdown with an unfinished request without inventing an observation for cancelled work. The three real timeout cases run concurrently but retain production 15-second deadlines. Install the FastAPI smoke dependencies and build release first. Raw logs, platform details, counters and result JSON stay under `tmp/m4/`; all existing smoke suites remain required. A passing campaign is finite evidence, not a load benchmark or complete request-coverage guarantee.
+
 ## FastAPI
 
 Create a Python 3.12 environment from the repository root:
@@ -200,7 +208,7 @@ Bodies and headers are excluded from observations. Sensitive/ambiguous query nam
 | HTTP 205 | No content; explicit Content-Length: 0; no Transfer-Encoding |
 | Shutdown | Stop accepting, up to 2 seconds for connections, then up to 2 seconds each for observation and diagnostic output |
 | Deployment | No built-in authentication, service registration, durable telemetry, or public-edge deployment hardening |
-| Future scope | No fault injection, anomaly inference, or propagation analysis implemented here |
+| Future scope | No fault injection, adaptive detection, root-cause inference or propagation analysis; existing M4 rules classify recorded evidence only |
 
 ## Troubleshooting
 
