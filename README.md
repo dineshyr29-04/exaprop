@@ -204,8 +204,11 @@ ExaProp is engineered as an empirical testbed for **distributed systems resilien
 | **M4.2** | Consumer-side pipeline coordinator, bounded queues & worker isolation | Merged into main in [PR #4](https://github.com/dineshyr29-04/exaprop/pull/4) |
 | **M4.3** | CLI anomaly reporting flags (`--detect`) and V1 telemetry formatting | Merged into main in [PR #5](https://github.com/dineshyr29-04/exaprop/pull/5) |
 | **M4.4** | End-to-end integration verification against real local backends | Merged into main in [PR #6](https://github.com/dineshyr29-04/exaprop/pull/6) |
-| **M4.5** | Final hardening audit, boundary fixes and regression validation | Implemented on `codex/m4-final-hardening`; not merged |
-| **M5+** | Controlled fault injection, chaos orchestration & resilience metrics | Research Horizon |
+| **M4.5** | Final hardening audit, boundary fixes and regression validation | Merged into main in [PR #7](https://github.com/dineshyr29-04/exaprop/pull/7) |
+| **M5.1** | Pure, validated fault-rule model and safety contract | Implemented on `codex/m5-controlled-faults`; library planning only, not merged |
+| **M5 runtime and later** | Controlled fault execution, CLI integration & resilience metrics | Not implemented |
+
+The M5.1 library model in [`core/src/fault.rs`](core/src/fault.rs) defaults to disabled and plans one effect for an exact method/raw-path selector: a 1–5,000 ms delay or an HTTP 500–599 error. A deterministic every-Nth schedule has an explicit selection-slot budget. Plans contain only a numeric rule ID and scalar effect, and are not proof that a fault was applied. The caller must supply unique matching-request ordinals; the pure model does not enforce an execution budget across callers. Runtime execution, cancellation, applied-fault evidence and CLI controls require separate integration. Current proxy traffic and M3/M4 output remain unchanged.
 
 ---
 

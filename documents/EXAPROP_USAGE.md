@@ -208,7 +208,7 @@ Bodies and headers are excluded from observations. Sensitive/ambiguous query nam
 | HTTP 205 | No content; explicit Content-Length: 0; no Transfer-Encoding |
 | Shutdown | Stop accepting, up to 2 seconds for connections, then up to 2 seconds each for observation and diagnostic output |
 | Deployment | No built-in authentication, service registration, durable telemetry, or public-edge deployment hardening |
-| Future scope | No fault injection, adaptive detection, root-cause inference or propagation analysis; existing M4 rules classify recorded evidence only |
+| Future scope | No runtime fault injection, adaptive detection, root-cause inference or propagation analysis; M5.1 provides library-only fault planning, and existing M4 rules classify recorded evidence only |
 
 ## Troubleshooting
 
