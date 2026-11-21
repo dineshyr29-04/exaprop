@@ -2103,6 +2103,61 @@ mod tests {
     }
 
     #[test]
+    fn partial_line_errors_preserve_written_unconfirmed_and_completion_counts() {
+        struct CutoffWriter {
+            bytes: Vec<u8>,
+            limit: usize,
+        }
+        impl Write for CutoffWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.bytes.len() == self.limit {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                let count = bytes.len().min(self.limit - self.bytes.len());
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("do not flush after a failed write");
+            }
+        }
+        let normal = b"normal\n";
+        let anomaly = b"anomaly\n";
+        for limit in [2, normal.len() + 2] {
+            let (tx, rx) = mpsc::channel(1);
+            tx.try_send(OutputBatch::new(
+                normal.to_vec().into_boxed_slice(),
+                Some(anomaly.to_vec().into_boxed_slice()),
+            ))
+            .unwrap();
+            let stats = DetectionStats::new_shared();
+            stats.batches_queued.store(1, Ordering::Relaxed);
+            stats.events_queued.store(1, Ordering::Relaxed);
+            let (done_tx, mut done_rx) = oneshot::channel();
+            let mut writer = CutoffWriter {
+                bytes: Vec::new(),
+                limit,
+            };
+            let error = run_writer(rx, &mut writer, Arc::clone(&stats), Some(done_tx)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(
+                done_rx.try_recv().unwrap().unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            let expected = [normal.as_slice(), anomaly.as_slice()].concat();
+            assert_eq!(writer.bytes, expected[..limit]);
+            let snapshot = stats.snapshot();
+            let completed_normal = u64::from(limit >= normal.len());
+            assert_eq!(snapshot.observations_written, completed_normal);
+            assert_eq!(snapshot.events_written, 0);
+            assert_eq!(snapshot.observations_unconfirmed(), 1 - completed_normal);
+            assert_eq!(snapshot.events_unconfirmed(), 1);
+            assert_eq!(snapshot.write_errors, 1);
+            assert!(tx.is_closed());
+        }
+    }
+
+    #[test]
     fn writer_handles_partial_anomaly_line_write() {
         struct FailOnAnomalyWriter {
             normal_written: bool,
