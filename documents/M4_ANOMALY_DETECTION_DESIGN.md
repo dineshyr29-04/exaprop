@@ -1,6 +1,6 @@
 # M4 — Deterministic HTTP anomaly detection
 
-Status: **M4.1–M4.4 merged; M4.5 final hardening implemented on `codex/m4-final-hardening`, not merged**. Local execution, hosted verification and merge approval are separate evidence.
+Status: **M4.1–M4.5 merged**, with final hardening merged in [PR #7](https://github.com/dineshyr29-04/exaprop/pull/7) at `d61528c7014fb30b9445c4fa0c8e18ba089c3ef9`. Local execution, hosted verification and merge approval are separate evidence. M5.1's pure fault model is separate from this M4 design and does not change its anomaly schema or runtime behavior.
 
 M4.5 audit baseline: merged M4.4 main at `e4852a69aa91316135077c2fb10ff7b7ee0a72a0` (PR #6). Demonstrated numeric-wrap regressions are fixed by saturating the legacy input/diagnostic/written counters without changing their fields or normal output. Invalid queue capacity/initial sequence and unrepresentable shutdown deadlines now return `InvalidInput` before worker startup or deadline arithmetic, instead of panicking. A real partial-write regression exercises both normal and anomaly-line accounting and completion-channel errors. These are reliability boundary fixes, not a claim of remotely exploitable vulnerabilities or complete security. Private vulnerability reporting was enabled with maintainer approval. No M5 behavior, protocol feature, queue redesign or anomaly-schema change is included.
 
@@ -376,7 +376,7 @@ Future integration evidence should include typed event fixtures/parsed fields, a
 
 ## 16. Implementation phases
 
-The phase table retains the approved scope and acceptance targets. M4.1–M4.4 are merged; M4.5 final hardening is implemented on its review branch. Later functionality requires separate design/implementation authorization; this document is not automatic authorization for future milestones.
+The phase table retains the approved scope and acceptance targets. M4.1–M4.5 are merged. Later functionality requires separate design/implementation authorization; this document is not automatic authorization for future milestones.
 
 | Phase | Expected files | Responsibilities | Tests / acceptance | Dependencies |
 | --- | --- | --- | --- | --- |
@@ -422,4 +422,4 @@ Expected runtime additions are one pure core module and one small CLI reporting 
 
 M4 does not include machine learning, adaptive statistical baselines, anomaly prediction, root-cause analysis, cross-service tracing, distributed correlation, fault injection, circuit breakers, automatic retries, anomaly-based request blocking, dashboards, persistent storage, cloud infrastructure, or OpenTelemetry exporters. It does not add HTTPS, streaming transport, new HTTP behavior, arbitrary output sinks, or a remote management service.
 
-Future proposals can revisit these topics with evidence and their own scope. M4.4 verifies the detector/pipeline/CLI; M4.5 hardens demonstrated boundary issues and audits existing guarantees. **M5 and later feature milestones remain separate and are not implemented here.**
+Future proposals can revisit these topics with evidence and their own scope. M4.4 verifies the detector/pipeline/CLI; M4.5 hardens demonstrated boundary issues and audits existing guarantees. **M5 remains separate: M5.1's library-only model does not execute faults or change M4 observations, classification or output. Runtime fault injection is not implemented.**

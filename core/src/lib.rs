@@ -4,6 +4,7 @@ mod counters;
 
 pub mod detection;
 pub mod diagnostics;
+pub mod fault;
 pub mod observation;
 pub mod proxy;
 

@@ -1,6 +1,6 @@
 # Contributing to ExaProp
 
-Contributions to code, tests, documentation, reproducible experiments, and tooling are welcome. M3 HTTP observability and M4.1–M4.4 anomaly detection/integration verification are merged into main; M4.5 final hardening is on its review branch. Check the [README](README.md#milestones--roadmap) before assuming a roadmap feature exists.
+Contributions to code, tests, documentation, reproducible experiments, and tooling are welcome. M3 HTTP observability and M4.1–M4.5 anomaly detection/hardening are merged into main. M5.1 adds a pure fault-planning library on its feature branch; runtime fault execution and CLI integration remain separate work. Check the [README](README.md#milestones--roadmap) before assuming a roadmap feature exists.
 
 ## Propose a change
 
