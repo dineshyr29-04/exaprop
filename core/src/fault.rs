@@ -196,6 +196,11 @@ fn valid_path(path: &str) -> bool {
 
 /// Immutable deterministic selection schedule. Both values are required;
 /// neither zero nor an unbounded budget has a special meaning.
+///
+/// ```compile_fail
+/// use core_engine::fault::FaultSchedule;
+/// let invalid = FaultSchedule { every_nth: 0, max_faults: 0 };
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FaultSchedule {
     every_nth: u32,
@@ -237,6 +242,13 @@ impl FaultSchedule {
 
 /// One validated rule. Numeric IDs must be nonsecret and nonzero; they are local
 /// labels, not globally unique identities or idempotency tokens.
+///
+/// ```compile_fail
+/// use core_engine::fault::{FaultEffect, FaultRule};
+/// fn replace(rule: &mut FaultRule, effect: FaultEffect) {
+///     rule.effect = effect;
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultRule {
     id: NonZeroU32,
@@ -279,6 +291,16 @@ impl FaultRule {
 
 /// Scalar-only intent, with no request reference, path, query, header or body.
 /// A future executor must record applied/cancelled/failed evidence separately.
+/// Only a policy constructs plans:
+///
+/// ```compile_fail
+/// use core_engine::fault::{FaultEffect, FaultPlan};
+/// use std::num::NonZeroU32;
+/// let forged = FaultPlan {
+///     rule_id: NonZeroU32::new(1).unwrap(),
+///     effect: FaultEffect::delay_ms(1).unwrap(),
+/// };
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FaultPlan {
     rule_id: NonZeroU32,
@@ -410,5 +432,244 @@ mod tests {
                 assert!(policy.plan(&Method::GET, "/other", ordinal(n)).is_none());
             }
         }
+    }
+
+    #[test]
+    fn only_server_error_statuses_are_accepted() {
+        // Exhaust the entire input type, independently of Hyper's status range.
+        let accepted: Vec<_> = (0..=u16::MAX)
+            .filter(|&status| FaultEffect::http_error(status).is_ok())
+            .collect();
+        assert_eq!(accepted, (500..=599).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn selectors_accept_exact_byte_limits_and_encoded_paths() {
+        let method = Method::from_bytes(&[b'X'; FaultSelector::MAX_METHOD_BYTES]).unwrap();
+        let path = format!("/{}", "a".repeat(FaultSelector::MAX_PATH_BYTES - 1));
+        assert!(FaultSelector::new(method.clone(), &path)
+            .unwrap()
+            .matches(&method, &path));
+        for path in [
+            "/",
+            "/a/b",
+            "/orders%2Fprivate",
+            "/%00/%ff",
+            "/-._~!$&'()*+,;=:@012AZaz",
+        ] {
+            assert!(FaultSelector::new(Method::GET, path)
+                .unwrap()
+                .matches(&Method::GET, path));
+        }
+    }
+
+    #[test]
+    fn selectors_reject_oversized_or_ambiguous_configuration() {
+        let method = Method::from_bytes(&[b'X'; FaultSelector::MAX_METHOD_BYTES + 1]).unwrap();
+        assert_eq!(
+            FaultSelector::new(method, "/"),
+            Err(FaultConfigError::InvalidMethod)
+        );
+        let oversized = format!("/{}", "a".repeat(FaultSelector::MAX_PATH_BYTES));
+        for path in [
+            "",
+            "relative",
+            "*",
+            "http://localhost/orders",
+            "/orders?token=private",
+            "/orders#fragment",
+            "/a b",
+            "/a\tb",
+            "/a\rb",
+            "/a\nb",
+            "/a\0b",
+            "/a\u{1b}b",
+            "/a\u{7f}b",
+            "/é",
+            "/a\\b",
+            "/a[b]",
+            "/a{b}",
+            "/a|b",
+            "/a^b",
+            "/a`b",
+            "/a\"b",
+            "/%",
+            "/%0",
+            "/%GG",
+            "/%G0",
+            "/%0G",
+            &oversized,
+        ] {
+            assert_eq!(
+                FaultSelector::new(Method::GET, path),
+                Err(FaultConfigError::InvalidPath)
+            );
+        }
+    }
+
+    #[test]
+    fn raw_matching_has_no_decoding_case_folding_or_query_interpretation() {
+        let selector = FaultSelector::new(Method::GET, "/Orders%2Fprivate").unwrap();
+        assert!(selector.matches(&Method::GET, "/Orders%2Fprivate"));
+        for path in [
+            "/orders%2Fprivate",
+            "/Orders%2fprivate",
+            "/Orders/private",
+            "/Orders%252Fprivate",
+            "/Orders%2Fprivate/",
+            "/Orders%2Fprivate-more",
+            "/Orders%2Fprivate?token=secret",
+            "/Orders%2Fprivate#fragment",
+        ] {
+            assert!(!selector.matches(&Method::GET, path));
+        }
+        assert!(!selector.matches(&Method::HEAD, "/Orders%2Fprivate"));
+        assert!(!selector.matches(&Method::from_bytes(b"get").unwrap(), "/Orders%2Fprivate"));
+        let extension = Method::from_bytes(b"CUSTOM").unwrap();
+        assert!(FaultSelector::new(extension.clone(), "/")
+            .unwrap()
+            .matches(&extension, "/"));
+    }
+
+    #[test]
+    fn selector_owns_validated_configuration_without_borrowing_input() {
+        let mut path = String::from("/orders");
+        let selector = FaultSelector::new(Method::GET, &path).unwrap();
+        path.clear();
+        assert!(selector.matches(&Method::GET, "/orders"));
+        assert!(!selector.matches(&Method::GET, &path));
+    }
+
+    #[test]
+    fn schedule_rejects_zero_and_out_of_range_values() {
+        for (interval, budget) in [
+            (0, 1),
+            (1, 0),
+            (0, 0),
+            (FaultSchedule::MAX_INTERVAL + 1, 1),
+            (1, FaultSchedule::MAX_FAULTS + 1),
+            (u32::MAX, 1),
+            (1, u32::MAX),
+        ] {
+            assert_eq!(
+                FaultSchedule::new(interval, budget),
+                Err(FaultConfigError::InvalidSchedule)
+            );
+        }
+        for interval in [1, FaultSchedule::MAX_INTERVAL] {
+            for budget in [1, FaultSchedule::MAX_FAULTS] {
+                assert_eq!(
+                    FaultSchedule::new(interval, budget).unwrap().every_nth(),
+                    interval
+                );
+                assert_eq!(
+                    FaultSchedule::new(interval, budget).unwrap().max_faults(),
+                    budget
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schedules_select_exactly_the_budgeted_periodic_slots() {
+        for interval in 1..=16 {
+            for budget in 1..=16 {
+                let schedule = FaultSchedule::new(interval, budget).unwrap();
+                let selected: Vec<_> = (1..=u64::from(interval * (budget + 2)))
+                    .filter(|&n| schedule.selects(ordinal(n)))
+                    .collect();
+                let expected: Vec<_> = (1..=budget).map(|n| u64::from(n * interval)).collect();
+                assert_eq!(selected, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_schedule_and_ordinal_boundaries_do_not_wrap_or_restart() {
+        for interval in [1, 2, 999_983, FaultSchedule::MAX_INTERVAL] {
+            let schedule = FaultSchedule::new(interval, FaultSchedule::MAX_FAULTS).unwrap();
+            let last = u64::from(interval) * u64::from(FaultSchedule::MAX_FAULTS);
+            assert!(schedule.selects(ordinal(u64::from(interval))));
+            assert!(schedule.selects(ordinal(last)));
+            for n in [last + 1, last + u64::from(interval), u64::MAX - 1, u64::MAX] {
+                assert!(!schedule.selects(ordinal(n)));
+            }
+        }
+    }
+
+    #[test]
+    fn debug_and_errors_do_not_disclose_configured_method_or_path() {
+        let secret_method = "PRIVATE_METHOD_SENTINEL";
+        let secret_path = "/PRIVATE_PATH_SENTINEL";
+        let policy = FaultPolicy::enabled(FaultRule::new(
+            NonZeroU32::new(9).unwrap(),
+            FaultSelector::new(
+                Method::from_bytes(secret_method.as_bytes()).unwrap(),
+                secret_path,
+            )
+            .unwrap(),
+            FaultEffect::http_error(503).unwrap(),
+            FaultSchedule::new(1, 1).unwrap(),
+        ));
+        let debug = format!("{policy:?}");
+        assert!(!debug.contains(secret_method));
+        assert!(!debug.contains(secret_path));
+        let invalid_path = format!("{secret_path}?token=SECRET_VALUE_SENTINEL");
+        let error = FaultSelector::new(Method::GET, &invalid_path).unwrap_err();
+        let display = format!("{error} {error:?}");
+        assert!(!display.contains("SENTINEL"));
+    }
+
+    #[test]
+    fn plans_outlive_metadata_and_preserve_only_scalar_intent() {
+        let plan = {
+            let policy = FaultPolicy::enabled(rule(FaultEffect::http_error(599).unwrap()));
+            let method = Method::from_bytes(b"GET").unwrap();
+            let path = String::from("/orders");
+            policy.plan(&method, &path, ordinal(2)).unwrap()
+        };
+        assert_eq!(plan.rule_id().get(), 7);
+        assert_eq!(plan.effect().status().unwrap().as_u16(), 599);
+        assert!(!format!("{plan:?}").contains("orders"));
+    }
+
+    #[test]
+    fn repeated_evaluation_is_pure_and_does_not_claim_budget_consumption() {
+        let policy = FaultPolicy::enabled(rule(FaultEffect::delay_ms(1).unwrap()));
+        let before = policy.clone();
+        let expected = policy.plan(&Method::GET, "/orders", ordinal(2));
+        assert!(expected.is_some());
+        for _ in 0..100 {
+            assert_eq!(policy.plan(&Method::GET, "/orders", ordinal(2)), expected);
+            assert!(policy.plan(&Method::GET, "/orders", ordinal(8)).is_none());
+        }
+        assert_eq!(policy, before);
+    }
+
+    #[test]
+    fn shared_concurrent_planning_is_deterministic_without_internal_state() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<FaultPolicy>();
+        send_sync::<FaultPlan>();
+        let policy = FaultPolicy::enabled(rule(FaultEffect::delay_ms(5).unwrap()));
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (1..=8)
+                .map(|n| {
+                    let policy = &policy;
+                    scope.spawn(move || policy.plan(&Method::GET, "/orders", ordinal(n)))
+                })
+                .collect();
+            let selected: Vec<_> = workers
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, worker)| {
+                    worker
+                        .join()
+                        .unwrap()
+                        .map(|plan| (i + 1, plan.rule_id().get()))
+                })
+                .collect();
+            assert_eq!(selected, [(2, 7), (4, 7), (6, 7)]);
+        });
     }
 }
