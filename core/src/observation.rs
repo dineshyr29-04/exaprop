@@ -23,6 +23,7 @@ struct QueueCounters {
 }
 
 /// A queue-counter snapshot. Concurrent updates may span the individual reads.
+/// Counters saturate at u64::MAX; exact totals are unavailable at that limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObservationStatsSnapshot {
     pub enqueued: u64,
@@ -47,15 +48,15 @@ impl ObservationStats {
     }
 
     pub(crate) fn record_enqueued(&self) {
-        self.inner.enqueued.fetch_add(1, Ordering::Relaxed);
+        crate::counters::increment(&self.inner.enqueued);
     }
 
     pub(crate) fn record_full(&self) {
-        self.inner.full.fetch_add(1, Ordering::Relaxed);
+        crate::counters::increment(&self.inner.full);
     }
 
     pub(crate) fn record_closed(&self) {
-        self.inner.closed.fetch_add(1, Ordering::Relaxed);
+        crate::counters::increment(&self.inner.closed);
     }
 }
 
@@ -234,6 +235,25 @@ fn hex_digit(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_counters_never_wrap_at_numeric_capacity() {
+        let stats = ObservationStats {
+            inner: Arc::new(QueueCounters {
+                enqueued: AtomicU64::new(u64::MAX),
+                full: AtomicU64::new(u64::MAX),
+                closed: AtomicU64::new(u64::MAX),
+            }),
+        };
+        stats.record_enqueued();
+        stats.record_full();
+        stats.record_closed();
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.enqueued, u64::MAX);
+        assert_eq!(snapshot.dropped_full, u64::MAX);
+        assert_eq!(snapshot.dropped_closed, u64::MAX);
+        assert_eq!(snapshot.dropped(), u64::MAX);
+    }
 
     #[test]
     fn sanitizes_sensitive_query_parameters() {

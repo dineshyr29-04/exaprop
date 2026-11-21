@@ -47,7 +47,19 @@ fn print_observations(
             timestamp.as_secs(),
             timestamp.subsec_nanos(),
         )?;
-        written.fetch_add(1, Ordering::Relaxed);
+        // Preserve the legacy output format while preventing numeric wraparound.
+        let mut current = written.load(Ordering::Relaxed);
+        while current < u64::MAX {
+            match written.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
     writer.flush()
 }
@@ -317,6 +329,25 @@ async fn finish_detection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_written_count_does_not_wrap() {
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(core_engine::Observation::new(
+            UNIX_EPOCH,
+            "orders".into(),
+            core_engine::Method::GET,
+            "/",
+            core_engine::StatusCode::OK,
+            Duration::ZERO,
+            core_engine::RequestOutcome::Success,
+        ))
+        .unwrap();
+        drop(tx);
+        let written = AtomicU64::new(u64::MAX);
+        print_observations(rx, io::sink(), &written).unwrap();
+        assert_eq!(written.load(Ordering::Relaxed), u64::MAX);
+    }
 
     #[test]
     fn detection_flags_validate_defaults_boundaries_and_dependency() {

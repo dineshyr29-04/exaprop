@@ -24,6 +24,8 @@ observation_output written=25 unconfirmed=0 drained=true
 
 `written` counts successful complete line writes. `unconfirmed` is enqueued minus written, floored at zero. A partial write or output failure may leave a record unconfirmed. A successful flush is not durable storage, and these counters do not account for a request cancelled before emission or for records lost when the process is forcibly terminated.
 
+M4.5 hardening makes M3 queue, diagnostic and legacy-written counters saturate at `u64::MAX` rather than wrap to zero. Values at that limit cannot establish exact totals or loss identities. Detection counters retain their existing explicit `counters_saturated` flag. Existing counter fields and output record formats are unchanged.
+
 Library callers can read live counters without parsing stderr:
 
 ```rust,no_run
